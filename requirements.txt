@@ -1,4 +1,5 @@
 langchain==0.3.26
+langchain-openai>=0.2.0
 langchain-huggingface==0.3.1
 langchain-text-splitters==0.3.8
 langchain-unstructured==0.1.6
@@ -9,5 +10,6 @@ Markdown==3.8.2
 sentence-transformers>=3.0.0
 lazy_loader==0.4
 rank_bm25==0.2.2
-openai==1.86.0
-zai-sdk == 0.2.2
+openai>=1.86.0
+# zai-sdk == 0.2.2
+python-dotenv>=1.0.0
