@@ -3,9 +3,10 @@ chat_controller.py — 对话控制器
 
 职责：
     1. 持有 Supervisor 实例，调用两级路由（规则层 + LLM 层）
-    2. 接收并存储 user_role，透传给所有 Agent
+    2. 接收并存储 user_role / user_id，透传给所有 Agent
     3. 管理多轮对话历史（仅 chitchat 意图，最多保留 3 轮），history 每条携带 user_role
-    4. 将 Agent 返回的统一响应字典透传给 View 层
+    4. 提供 process_message（文本对话）和 process_file（文件上传）两个入口
+    5. 将 Agent 返回的统一响应字典透传给 View 层
 """
 
 import logging
@@ -41,14 +42,15 @@ class ChatController:
         调用对应 Agent，返回统一响应字典
     """
 
-    def __init__(self, user_role: str = "recruiter"):
+    def __init__(self, user_role: str = "recruiter", user_id: int = 0):
         """
         Args:
-            user_role: 当前用户角色，透传给所有 Agent，供后续 prompt 分支使用。
-                       默认 "recruiter"，可选值由业务层约定
-                       （如 "recruiter" / "candidate" / "admin"）
+            user_role: 当前用户角色，透传给所有 Agent。
+                       可选值："recruiter" / "jobseeker" / "admin"
+            user_id:   当前登录用户的系统 ID，jobseeker 简历存库时使用
         """
         self.user_role = user_role
+        self.user_id   = user_id
 
         self.supervisor = Supervisor(
             temperature=0.0,
@@ -60,7 +62,7 @@ class ChatController:
         self._chitchat_history: deque[dict] = deque(maxlen=_MAX_HISTORY_TURNS * 2)
 
         self._agent_map = {
-            "resume_parse": self._call_resume,
+            "resume_parse": self._call_resume_text,  # 文本路由走此入口
             "job_match":    self._call_match,
             "knowledge":    self._call_knowledge,
             "chitchat":     self._call_chitchat,
@@ -71,7 +73,7 @@ class ChatController:
 
     def process_message(self, user_input: str) -> dict:
         """
-        处理用户消息，返回统一响应字典。
+        处理纯文本对话，返回统一响应字典。
 
         Args:
             user_input: 用户原始输入
@@ -87,10 +89,36 @@ class ChatController:
             logger.error(f"处理消息时出错: {e}")
             response = {
                 "intent": "unknown",
-                "data": {"message": "系统出现异常，请稍后重试。"},
+                "data":   {"message": "系统出现异常，请稍后重试。"},
                 "status": "error",
             }
+        return response
 
+    def process_file(self, file_path: str) -> dict:
+        """
+        处理文件上传（简历解析），直接调用 resume_agent，跳过路由。
+
+        Args:
+            file_path: 上传文件的本地路径（.pdf 或 .docx）
+
+        Returns:
+            统一响应字典
+        """
+        try:
+            response = resume_agent.handle(
+                file_path = file_path,
+                user_role = self.user_role,
+                history   = [],
+                llm       = self.supervisor.llm,
+                user_id   = self.user_id,
+            )
+        except Exception as e:
+            logger.error(f"文件处理时出错: {e}")
+            response = {
+                "intent": "resume_parse",
+                "data":   {"message": "文件处理失败，请检查文件格式后重试。"},
+                "status": "error",
+            }
         return response
 
     def get_routing_stats(self) -> dict:
@@ -114,29 +142,35 @@ class ChatController:
         history = list(self._chitchat_history)
 
         response = chitchat_agent.handle(
-            query=query,
-            history=history,
-            llm=self.supervisor.llm,
-            user_role=self.user_role,
+            query     = query,
+            history   = history,
+            llm       = self.supervisor.llm,
+            user_role = self.user_role,
         )
 
         # 追加本轮到历史，每条带上 user_role 备用
         self._chitchat_history.append({
-            "role": "user",
-            "content": query,
+            "role":      "user",
+            "content":   query,
             "user_role": self.user_role,
         })
         self._chitchat_history.append({
-            "role": "assistant",
-            "content": response["data"]["message"],
+            "role":      "assistant",
+            "content":   response["data"]["message"],
             "user_role": self.user_role,
         })
-
         return response
 
-    def _call_resume(self, query: str) -> dict:
-        result = resume_agent.handle(query, user_role=self.user_role)
-        return {"intent": "resume_parse", "data": {"message": result}, "status": "success"}
+    def _call_resume_text(self, query: str) -> dict:
+        """
+        文本路由触发的简历意图：用户说"帮我分析简历"但还没上传文件时的引导回复。
+        实际文件解析走 process_file()。
+        """
+        return {
+            "intent": "resume_parse",
+            "data":   {"message": "请上传您的简历文件（支持 .pdf 和 .docx 格式），我来为您解析。"},
+            "status": "success",
+        }
 
     def _call_match(self, query: str) -> dict:
         result = match_agent.handle(query, user_role=self.user_role)
