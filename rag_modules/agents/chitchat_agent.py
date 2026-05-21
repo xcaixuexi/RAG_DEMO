@@ -104,15 +104,17 @@ def handle(
     query: str,
     history: Optional[list[dict]] = None,
     llm: Optional[ChatOpenAI] = None,
+    user_role: str = "recruiter",
 ) -> dict:
     """
     闲聊 Agent 主入口。
 
     Args:
-        query:   用户当前输入
-        history: 多轮对话历史，格式为 [{"role": "user"|"assistant", "content": "..."}]
-                 由 ChatController 统一管理，最多传入最近 3 轮（6 条消息）
-        llm:     ChatOpenAI 实例，由 ChatController 从 Supervisor 传入，避免重复初始化
+        query:     用户当前输入
+        history:   多轮对话历史，格式为 [{"role": "...", "content": "...", "user_role": "..."}]
+                   由 ChatController 统一管理，最多传入最近 3 轮（6 条消息）
+        llm:       ChatOpenAI 实例，由 ChatController 从 Supervisor 传入，避免重复初始化
+        user_role: 用户角色（如 "recruiter" / "candidate"），暂不用于 prompt，预留后续分支
 
     Returns:
         统一响应字典：{"intent": "chitchat", "data": {"message": "..."}, "status": "success"}

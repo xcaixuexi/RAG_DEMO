@@ -1,7 +1,7 @@
 from langchain_unstructured import UnstructuredLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 
-def handle(query: str) -> str:
+def handle(query: str, user_role: str = "recruiter") -> str:
     # query 可能是文件路径 "file:resume.pdf"
     if query.startswith("file:"):
         path = query[5:]

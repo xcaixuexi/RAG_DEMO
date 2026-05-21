@@ -3,8 +3,8 @@ chat_controller.py — 对话控制器
 
 职责：
     1. 持有 Supervisor 实例，调用两级路由（规则层 + LLM 层）
-    2. 管理多轮对话历史（仅 chitchat 意图，最多保留 3 轮）
-    3. 将 llm 实例和 history 传给 chitchat_agent，其余 Agent 保持原有签名
+    2. 接收并存储 user_role，透传给所有 Agent
+    3. 管理多轮对话历史（仅 chitchat 意图，最多保留 3 轮），history 每条携带 user_role
     4. 将 Agent 返回的统一响应字典透传给 View 层
 """
 
@@ -41,7 +41,15 @@ class ChatController:
         调用对应 Agent，返回统一响应字典
     """
 
-    def __init__(self):
+    def __init__(self, user_role: str = "recruiter"):
+        """
+        Args:
+            user_role: 当前用户角色，透传给所有 Agent，供后续 prompt 分支使用。
+                       默认 "recruiter"，可选值由业务层约定
+                       （如 "recruiter" / "candidate" / "admin"）
+        """
+        self.user_role = user_role
+
         self.supervisor = Supervisor(
             temperature=0.0,
             rule_confidence_threshold=1,
@@ -51,7 +59,6 @@ class ChatController:
         # chitchat 多轮历史：deque 自动滚动，maxlen = 轮数 × 2（user + assistant）
         self._chitchat_history: deque[dict] = deque(maxlen=_MAX_HISTORY_TURNS * 2)
 
-        # 其他 Agent 保持原有 handle(query) -> str 签名，统一包装为响应字典
         self._agent_map = {
             "resume_parse": self._call_resume,
             "job_match":    self._call_match,
@@ -103,36 +110,42 @@ class ChatController:
     # ==================== 各 Agent 调用封装 ====================
 
     def _call_chitchat(self, query: str) -> dict:
-        """
-        调用 chitchat_agent，传入历史和 llm 实例。
-        将本轮对话追加到历史中（仅 LLM 回复才有意义，模板回复也记录保持连贯）。
-        """
+        """调用 chitchat_agent，传入历史、llm 实例和 user_role。"""
         history = list(self._chitchat_history)
 
         response = chitchat_agent.handle(
             query=query,
             history=history,
-            llm=self.supervisor.llm,        # 复用 Supervisor 已初始化的 llm，避免重复创建
+            llm=self.supervisor.llm,
+            user_role=self.user_role,
         )
 
-        # 追加本轮到历史（deque 满时自动丢弃最早一轮的两条）
-        self._chitchat_history.append({"role": "user",      "content": query})
-        self._chitchat_history.append({"role": "assistant", "content": response["data"]["message"]})
+        # 追加本轮到历史，每条带上 user_role 备用
+        self._chitchat_history.append({
+            "role": "user",
+            "content": query,
+            "user_role": self.user_role,
+        })
+        self._chitchat_history.append({
+            "role": "assistant",
+            "content": response["data"]["message"],
+            "user_role": self.user_role,
+        })
 
         return response
 
     def _call_resume(self, query: str) -> dict:
-        result = resume_agent.handle(query)
+        result = resume_agent.handle(query, user_role=self.user_role)
         return {"intent": "resume_parse", "data": {"message": result}, "status": "success"}
 
     def _call_match(self, query: str) -> dict:
-        result = match_agent.handle(query)
+        result = match_agent.handle(query, user_role=self.user_role)
         return {"intent": "job_match", "data": {"message": result}, "status": "success"}
 
     def _call_knowledge(self, query: str) -> dict:
-        result = knowledge_agent.handle(query)
+        result = knowledge_agent.handle(query, user_role=self.user_role)
         return {"intent": "knowledge", "data": {"message": result}, "status": "success"}
 
     def _call_unknown(self, query: str) -> dict:
-        result = unknown_agent.handle(query)
+        result = unknown_agent.handle(query, user_role=self.user_role)
         return {"intent": "unknown", "data": {"message": result}, "status": "success"}
