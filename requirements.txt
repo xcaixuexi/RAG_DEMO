@@ -5,6 +5,12 @@ Markdown==3.8.2
 lazy_loader==0.4
 
 # zai-sdk == 0.2.2
+
+# Web
+fastapi>=0.110.0
+uvicorn>=0.29.0
+python-multipart>=0.0.9
+
 # LLM
 langchain==0.3.26
 langchain-openai>=0.2.0
