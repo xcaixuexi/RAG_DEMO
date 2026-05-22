@@ -42,7 +42,7 @@ class ChatController:
         调用对应 Agent，返回统一响应字典
     """
 
-    def __init__(self, user_role: str = "recruiter", user_id: int = 0):
+    def __init__(self, user_role: str = "jobseeker", user_id: int = 0):
         """
         Args:
             user_role: 当前用户角色，透传给所有 Agent。
@@ -51,6 +51,7 @@ class ChatController:
         """
         self.user_role = user_role
         self.user_id   = user_id
+        self._pending_file_path = None
 
         self.supervisor = Supervisor(
             temperature=0.0,
@@ -62,7 +63,7 @@ class ChatController:
         self._chitchat_history: deque[dict] = deque(maxlen=_MAX_HISTORY_TURNS * 2)
 
         self._agent_map = {
-            "resume_parse": self._call_resume_text,  # 文本路由走此入口
+            "resume_parse": self._call_resume,
             "job_match":    self._call_match,
             "knowledge":    self._call_knowledge,
             "chitchat":     self._call_chitchat,
@@ -94,7 +95,7 @@ class ChatController:
             }
         return response
 
-    def process_file(self, file_path: str) -> dict:
+    def process_file(self, file_path: str = "D:/JIAOXUEWENJIAN/RAG+LLM/pdf_text.pdf") -> dict:
         """
         处理文件上传（简历解析），直接调用 resume_agent，跳过路由。
 
@@ -161,14 +162,17 @@ class ChatController:
         })
         return response
 
-    def _call_resume_text(self, query: str) -> dict:
+    def _call_resume(self, query: str) -> dict:
         """
-        文本路由触发的简历意图：用户说"帮我分析简历"但还没上传文件时的引导回复。
-        实际文件解析走 process_file()。
+        有文件路径 → 调用 process_file() 真正解析
+        无文件路径 → 返回提示文字引导用户上传
         """
+        if self._pending_file_path:
+            file_path = self._pending_file_path.replace('\\', '/')
+            return self.process_file(file_path)
         return {
             "intent": "resume_parse",
-            "data":   {"message": "请上传您的简历文件（支持 .pdf 和 .docx 格式），我来为您解析。"},
+            "data": {"message": "请上传您的简历文件（支持 .pdf 和 .docx 格式），我来为您解析。"},
             "status": "success",
         }
 

@@ -80,25 +80,25 @@ def _parse_docx(file_path: str) -> str:
 _PARSE_SYSTEM = """你是一个专业的简历解析器。
 从用户提供的简历文本中提取结构化信息，严格按照以下 JSON 格式输出，不要输出任何解释或多余文字：
 
-{
+{{
     "name": "姓名",
     "age": "年龄",
     "education": "最高学历",
     "years_of_experience": "工作年限",
     "current_position": "当前/最近职位",
     "skills": [
-        {"skill_name": "技能名称", "skill_level": "掌握程度"}
+        {{"skill_name": "技能名称", "skill_level": "掌握程度"}}
     ],
     "experience": [
-        {
+        {{
             "company": "公司名称",
             "position": "职位",
             "start_date": "开始时间",
             "end_date": "结束时间",
             "description": "工作描述"
-        }
+        }}
     ]
-}
+}}
 
 信息缺失时对应字段填空字符串""，技能和经历为空时填空数组[]。"""
 
@@ -236,7 +236,7 @@ def _error_response(message: str) -> dict:
 # ─────────────────────────────────────────────
 
 def handle(
-    file_path: str,
+    file_path: str = "D:/JIAOXUEWENJIAN/RAG+LLM/pdf_text.pdf",
     user_role: str = "recruiter",
     history:   Optional[list[dict]] = None,
     llm:       Optional[ChatOpenAI] = None,

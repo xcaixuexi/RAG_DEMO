@@ -29,11 +29,13 @@ class Supervisor:
     def __init__(
         self,
         model_name: str = "glm-4.5-air",
+        # model_name: str = "deepseek-v4-flash",
         temperature: float = 0.0,
         top_p: float = 0.9,
-        max_tokens: int = 512,
+        max_tokens: int = 2048,
         api_key: Optional[str] = None,
         base_url: str = "https://open.bigmodel.cn/api/paas/v4/",
+        # base_url: str = "https://api.deepseek.com",
         rule_confidence_threshold: int = 1,
         enable_rule_router: bool = True,
     ):
@@ -74,7 +76,8 @@ class Supervisor:
         key = api_key
         if not key:
             load_dotenv()
-            key = os.getenv("ZHIPU_API_KEY") or os.getenv("OPENAI_API_KEY")
+            key = os.getenv("ZHIPU_API_KEY")
+            # key = os.getenv("OPENAI_API_KEY")
 
         if not key:
             raise ValueError("请设置 ZHIPU_API_KEY 或 OPENAI_API_KEY 环境变量，或通过 api_key 参数传入")

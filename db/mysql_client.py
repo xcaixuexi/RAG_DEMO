@@ -45,7 +45,7 @@ class MySQLClient:
         host     = host     or os.getenv("MYSQL_HOST",     "localhost")
         port     = port     or int(os.getenv("MYSQL_PORT", "3306"))
         user     = user     or os.getenv("MYSQL_USER",     "root")
-        password = password or os.getenv("MYSQL_PASSWORD", "")
+        password = password or os.getenv("MYSQL_PASSWORD", "123456")
         db       = db       or os.getenv("MYSQL_DB",       "recruitment")
 
         url = f"mysql+pymysql://{user}:{password}@{host}:{port}/{db}?charset=utf8mb4"
