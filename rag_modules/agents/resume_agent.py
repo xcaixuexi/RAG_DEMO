@@ -7,20 +7,21 @@ resume_agent.py — 简历解析 Agent
     文件解析层（PyMuPDF / python-docx）→ 纯文本
         ↓
     按 user_role 分支：
-        jobseeker → LLM 解析 JSON → 存库 → LLM 生成优化建议 → 返回前端
-        recruiter → LLM 解析+分析 → 适配度摘要 → 返回前端（不存库）
+        jobseeker → LLM 分析 → 优化建议返回前端
+        recruiter → LLM 分析 → 适配度摘要返回前端
+
+    两个分支均不写库。
 
 函数签名：
-    handle(file_path, user_role, history) -> dict
+    handle(file_path, user_role, history, llm, user_id) -> dict
 """
 
 import os
-import json
 import logging
 from typing import Optional
 
-import fitz                          # PyMuPDF，pip install pymupdf
-from docx import Document            # python-docx
+import fitz                 # PyMuPDF
+from docx import Document   # python-docx
 
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
@@ -34,12 +35,8 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────
 
 def _extract_text(file_path: str) -> str:
-    """
-    根据文件后缀选择解析器，返回纯文本。
-    支持 .pdf（PyMuPDF）和 .docx（python-docx）。
-    """
+    """根据后缀选择解析器，返回纯文本"""
     ext = os.path.splitext(file_path)[-1].lower()
-
     if ext == ".pdf":
         return _parse_pdf(file_path)
     elif ext == ".docx":
@@ -56,7 +53,7 @@ def _parse_pdf(file_path: str) -> str:
             text_blocks.append(page.get_text("text"))
     raw = "\n".join(text_blocks).strip()
     if not raw:
-        raise ValueError("PDF 文件内容为空，可能是扫描件，暂不支持 OCR 解析")
+        raise ValueError("PDF 内容为空，可能是扫描件，暂不支持 OCR 解析")
     logger.info(f"PDF 解析完成，字符数: {len(raw)}")
     return raw
 
@@ -76,42 +73,20 @@ def _parse_docx(file_path: str) -> str:
 # Prompt 定义
 # ─────────────────────────────────────────────
 
-# 求职者：解析为结构化 JSON（存库用）
-_PARSE_SYSTEM = """你是一个专业的简历解析器。
-从用户提供的简历文本中提取结构化信息，严格按照以下 JSON 格式输出，不要输出任何解释或多余文字：
-
-{{
-    "name": "姓名",
-    "age": "年龄",
-    "education": "最高学历",
-    "years_of_experience": "工作年限",
-    "current_position": "当前/最近职位",
-    "skills": [
-        {{"skill_name": "技能名称", "skill_level": "掌握程度"}}
-    ],
-    "experience": [
-        {{
-            "company": "公司名称",
-            "position": "职位",
-            "start_date": "开始时间",
-            "end_date": "结束时间",
-            "description": "工作描述"
-        }}
-    ]
-}}
-
-信息缺失时对应字段填空字符串""，技能和经历为空时填空数组[]。"""
-
-# 求职者：基于解析结果生成优化建议（返回前端）
+# 求职者：生成简历优化建议
 _JOBSEEKER_ADVICE_SYSTEM = """你是一位资深招聘顾问，专注于帮助求职者优化简历。
-根据候选人的简历信息，给出具体、可执行的简历优化建议。
-语气友好专业，建议条理清晰，聚焦在表达方式、信息完整度、亮点突出等方面。"""
+根据候选人提供的简历全文，给出具体、可执行的优化建议。
+语气友好专业，建议条理清晰，聚焦在以下方面：
+- 内容完整度（缺少哪些关键信息）
+- 亮点突出（如何更好地展示核心竞争力）
+- 表达方式（量化成果、动词选用等）
+- 格式建议（如适用）"""
 
-# 招聘者：解析+分析，返回摘要（不存库）
+# 招聘者：生成候选人评估报告
 _RECRUITER_ANALYSIS_SYSTEM = """你是一位专业的招聘顾问，协助招聘者快速评估候选人简历。
-请对简历进行全面分析，输出包含以下内容的评估报告：
-1. 候选人基本信息摘要（姓名、学历、工作年限、当前职位）
-2. 核心技能和专业亮点
+请对简历进行全面分析，输出结构清晰的评估报告，包含：
+1. 基本信息摘要（姓名、学历、工作年限、当前职位）
+2. 核心技能与专业亮点
 3. 职业发展轨迹分析
 4. 综合评价与适用岗位建议
 语言简洁专业，便于招聘者快速决策。"""
@@ -131,97 +106,35 @@ def _llm_call(llm: ChatOpenAI, system: str, user_content: str) -> str:
     return chain.invoke({"input": user_content}).strip()
 
 
-def _parse_json_safe(text: str) -> Optional[dict]:
-    """
-    安全解析 LLM 返回的 JSON，兼容带 ```json 围栏的情况。
-    解析失败返回 None。
-    """
-    # 去除 markdown 代码块围栏
-    cleaned = text.strip()
-    if cleaned.startswith("```"):
-        lines = cleaned.splitlines()
-        cleaned = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
-    try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError as e:
-        logger.error(f"JSON 解析失败: {e}\n原始文本: {text[:200]}")
-        return None
-
-
 # ─────────────────────────────────────────────
 # 业务分支
 # ─────────────────────────────────────────────
 
-def _handle_jobseeker(
-    raw_text: str,
-    llm: ChatOpenAI,
-    user_id: int,
-) -> dict:
+def _handle_jobseeker(raw_text: str, llm: ChatOpenAI) -> dict:
     """
-    求职者流程：
-        1. LLM 解析 → JSON → 存库
-        2. LLM 生成优化建议 → 返回前端
+    求职者流程：LLM 分析简历 → 返回优化建议
+    不存库。
     """
-    # Step 1：解析为 JSON
-    parse_result = _llm_call(llm, _PARSE_SYSTEM, raw_text)
-    parsed = _parse_json_safe(parse_result)
-
-    if parsed is None:
-        return _error_response("简历解析失败，请确认文件内容完整后重试")
-
-    # Step 2：存库
-    try:
-        from db.mysql_client import MySQLClient
-        db = MySQLClient()
-        candidate_id = db.save_candidate(
-            user_id  = user_id,
-            parsed   = parsed,
-            raw_text = raw_text,
-        )
-        logger.info(f"简历已存库: candidate_id={candidate_id}")
-    except Exception as e:
-        # 存库失败不阻断主流程，记录日志后继续
-        logger.error(f"简历存库失败: {e}")
-        candidate_id = None
-
-    # Step 3：生成优化建议
-    summary = (
-        f"姓名：{parsed.get('name', '未知')}\n"
-        f"学历：{parsed.get('education', '未知')}\n"
-        f"年限：{parsed.get('years_of_experience', '未知')}\n"
-        f"当前职位：{parsed.get('current_position', '未知')}\n"
-        f"技能：{', '.join(s.get('skill_name','') for s in parsed.get('skills', []))}"
-    )
-    advice = _llm_call(llm, _JOBSEEKER_ADVICE_SYSTEM, f"以下是候选人简历摘要：\n{summary}")
-
+    advice = _llm_call(llm, _JOBSEEKER_ADVICE_SYSTEM, raw_text)
     return {
         "intent": "resume_parse",
-        "data": {
-            "message":      advice,
-            "candidate_id": candidate_id,   # 供前端后续关联使用
-            "parsed":       parsed,         # 供前端展示结构化信息
-        },
+        "data":   {"message": advice},
         "status": "success",
     }
 
 
 def _handle_recruiter(raw_text: str, llm: ChatOpenAI) -> dict:
     """
-    招聘者流程：
-        LLM 解析 + 分析 → 适配度摘要 → 返回前端（不存库）
+    招聘者流程：LLM 分析简历 → 返回评估报告
+    不存库。
     """
     analysis = _llm_call(llm, _RECRUITER_ANALYSIS_SYSTEM, raw_text)
-
     return {
         "intent": "resume_parse",
-        "data": {"message": analysis},
+        "data":   {"message": analysis},
         "status": "success",
     }
 
-
-# ─────────────────────────────────────────────
-# 工具函数
-# ─────────────────────────────────────────────
 
 def _error_response(message: str) -> dict:
     return {
@@ -236,30 +149,28 @@ def _error_response(message: str) -> dict:
 # ─────────────────────────────────────────────
 
 def handle(
-    file_path: str = "D:/JIAOXUEWENJIAN/RAG+LLM/pdf_text.pdf",
-    user_role: str = "recruiter",
+    file_path: str,
+    user_role: str,
     history:   Optional[list[dict]] = None,
     llm:       Optional[ChatOpenAI] = None,
-    user_id:   int = 0,
+    user_id:   int = 0,              # 保留字段，当前不用于存库，供后续业务扩展
 ) -> dict:
     """
     简历解析 Agent 主入口。
 
     Args:
-        file_path: 简历文件的本地路径（.pdf 或 .docx）
-        user_role: "recruiter" | "jobseeker"，决定业务分支
-        history:   多轮对话历史（当前暂未使用，预留接口）
+        file_path: 简历文件本地路径（.pdf 或 .docx）
+        user_role: "recruiter" | "jobseeker"，决定返回内容风格
+        history:   多轮对话历史（预留，暂未使用）
         llm:       ChatOpenAI 实例，由 ChatController 从 Supervisor 传入
-        user_id:   求职者账号 ID，jobseeker 分支存库时使用
+        user_id:   用户 ID（保留字段，当前不使用）
 
     Returns:
         统一响应字典：
-            jobseeker → {"intent": "resume_parse", "data": {"message": 建议, "candidate_id": id, "parsed": {...}}, "status": "success"}
-            recruiter → {"intent": "resume_parse", "data": {"message": 摘要}, "status": "success"}
+            {"intent": "resume_parse", "data": {"message": "..."}, "status": "success"/"error"}
     """
     history = history or []
 
-    # 校验 llm
     if llm is None:
         logger.error("[resume_agent] llm 未传入")
         return _error_response("系统配置错误，请联系管理员")
@@ -277,7 +188,6 @@ def handle(
 
     # 按角色分支
     if user_role == "jobseeker":
-        return _handle_jobseeker(raw_text, llm, user_id)
+        return _handle_jobseeker(raw_text, llm)
     else:
-        # recruiter 及其他角色均走招聘者分析流程
         return _handle_recruiter(raw_text, llm)
