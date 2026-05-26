@@ -123,7 +123,7 @@ def _handle_jobseeker(query: str, llm: ChatOpenAI, repo: JobRepo) -> dict:
     if parsed is None or "sql" not in parsed:
         logger.error("[match_agent] LLM 未返回有效 SQL JSON")
         return _error_response("条件解析失败，请重新描述您的需求")
-    print(parsed)
+    # print(parsed)
 
     sql     = parsed["sql"]
     hint    = parsed.get("message", "正在为您搜索匹配职位")
