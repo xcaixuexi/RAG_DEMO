@@ -86,7 +86,7 @@ _RESUME_PATTERNS: list[re.Pattern] = [
 
 # ── job_match ─────────────────────────────────
 _MATCH_KEYWORDS: list[str] = [
-    "匹配候选人", "推荐候选人", "推荐人才", "找候选人", "找人才",
+    "匹配候选人", "推荐候选人", "推荐职位", "找候选人", "找人才",
     "筛选简历",   # 注意："筛选简历"归 job_match，纯"简历"归 resume_parse
     "招聘需求", "岗位需求", "职位描述", "招募", "招人",
     "合适的人", "符合条件", "人才库", "候选人推荐",
@@ -176,7 +176,7 @@ _EXACT_MAP: dict[str, Intent] = {
     "简历解析": "resume_parse",
     # job_match
     "匹配候选人": "job_match",
-    "推荐候选人": "job_match",
+    "推荐岗位": "job_match",
     "推荐人才": "job_match",
     "找候选人": "job_match",
     "筛选简历": "job_match",

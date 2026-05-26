@@ -47,11 +47,11 @@ class ChatController:
         Args:
             user_role: 当前用户角色，透传给所有 Agent。
                        可选值："recruiter" / "jobseeker" / "admin"
-            user_id:   当前登录用户的系统 ID，jobseeker 简历存库时使用
+            user_id:   当前登录用户的系统 ID，透传给 Agent，供后续业务扩展使用
         """
         self.user_role = user_role
         self.user_id   = user_id
-        self._pending_file_path = None
+        self._pending_file_path = None   # CLI 场景暂存待解析的文件路径
 
         self.supervisor = Supervisor(
             temperature=0.0,
@@ -95,7 +95,7 @@ class ChatController:
             }
         return response
 
-    def process_file(self, file_path: str = "D:/JIAOXUEWENJIAN/RAG+LLM/pdf_text.pdf") -> dict:
+    def process_file(self, file_path: str) -> dict:
         """
         处理文件上传（简历解析），直接调用 resume_agent，跳过路由。
 
@@ -103,7 +103,7 @@ class ChatController:
             file_path: 上传文件的本地路径（.pdf 或 .docx）
 
         Returns:
-            统一响应字典
+            统一响应字典（resume_agent 内部按 user_role 分支处理，均不写库）
         """
         try:
             response = resume_agent.handle(
@@ -164,21 +164,27 @@ class ChatController:
 
     def _call_resume(self, query: str) -> dict:
         """
-        有文件路径 → 调用 process_file() 真正解析
-        无文件路径 → 返回提示文字引导用户上传
+        文本路由命中 resume_parse 时的入口。
+        CLI 场景：_pending_file_path 有值时直接解析文件。
+        Web 场景：_pending_file_path 为 None，返回引导提示，
+                  实际文件解析由前端上传后调用 process_file() 处理。
         """
         if self._pending_file_path:
             file_path = self._pending_file_path.replace('\\', '/')
             return self.process_file(file_path)
         return {
             "intent": "resume_parse",
-            "data": {"message": "请上传您的简历文件（支持 .pdf 和 .docx 格式），我来为您解析。"},
+            "data":   {"message": "请上传您的简历文件（支持 .pdf 和 .docx 格式），我来为您解析。"},
             "status": "success",
         }
 
     def _call_match(self, query: str) -> dict:
-        result = match_agent.handle(query, user_role=self.user_role)
-        return {"intent": "job_match", "data": {"message": result}, "status": "success"}
+        return match_agent.handle(
+            query     = query,
+            user_role = self.user_role,
+            history   = [],
+            llm       = self.supervisor.llm,
+        )
 
     def _call_knowledge(self, query: str) -> dict:
         result = knowledge_agent.handle(query, user_role=self.user_role)

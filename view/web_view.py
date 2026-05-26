@@ -41,7 +41,7 @@ app.add_middleware(
 
 class ChatRequest(BaseModel):
     user_id:   int
-    user_role: str = "recruiter"   # recruiter | jobseeker
+    user_role: str   # recruiter | jobseeker
     message:   str
 
 
@@ -54,7 +54,9 @@ async def chat(request: ChatRequest) -> dict:
     """
     文字对话接口。
 
-    每次请求独立初始化 ChatController（无状态，user_role/user_id 从请求体取）。
+    每次请求独立初始化 ChatController（无状态，user_role/user_id 从请求体取）。\n
+    recruiter 招聘者\n
+    jobseeker 求职者
     """
     controller = ChatController(
         user_role=request.user_role,
