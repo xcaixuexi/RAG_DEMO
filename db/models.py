@@ -89,7 +89,8 @@ class Company(Base):
     industry_company_type_id = Column(BigInteger,   nullable=True,  default=0, comment="企业类型id")
     master_id_positive       = Column(String(500),  nullable=True,  default="", comment="法人身份证照片")
 
-    jobs = relationship("Job", back_populates="company", foreign_keys="Job.company_id")
+    jobs         = relationship("Job",            back_populates="company",  foreign_keys="Job.company_id")
+    applications = relationship("EmployeesApply", back_populates="company",  foreign_keys="EmployeesApply.company_id")
 
     def __repr__(self):
         return f"<Company id={self.id} name={self.name}>"
@@ -252,7 +253,8 @@ class EmployeesApply(Base):
     update_time         = Column(DateTime,      nullable=True,  comment="更新时间")
     labornew_apply_id   = Column(BigInteger,    nullable=True,  default=0, comment="求职平台报名id")
 
-    job = relationship("Job", back_populates="applications", foreign_keys=[job_id])
+    job     = relationship("Job",     back_populates="applications", foreign_keys=[job_id])
+    company = relationship("Company", back_populates="applications", foreign_keys=[company_id])
 
     def __repr__(self):
         return f"<EmployeesApply id={self.id} user_id={self.user_id} job_id={self.job_id} status={self.status}>"
