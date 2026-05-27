@@ -187,9 +187,17 @@ class ChatController:
         )
 
     def _call_knowledge(self, query: str) -> dict:
-        result = knowledge_agent.handle(query, user_role=self.user_role)
-        return {"intent": "knowledge", "data": {"message": result}, "status": "success"}
+        return knowledge_agent.handle(
+            query     = query,
+            user_role = self.user_role,
+            history   = [],
+            llm       = self.supervisor.llm,
+        )
 
     def _call_unknown(self, query: str) -> dict:
-        result = unknown_agent.handle(query, user_role=self.user_role)
-        return {"intent": "unknown", "data": {"message": result}, "status": "success"}
+        return unknown_agent.handle(
+            query     = query,
+            user_role = self.user_role,
+            history   = [],
+            llm       = self.supervisor.llm,
+        )
