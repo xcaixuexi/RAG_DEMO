@@ -174,6 +174,40 @@ class JobRepo:
             logger.error(f"[job_repo] apply SQL 执行失败: {e} | SQL: {sql[:200]}")
             return []
 
+    def execute_count_query(self, sql: str) -> int:
+        """
+        执行统计查询，返回数量。
+
+        安全校验：
+            1. 必须以 SELECT 开头
+            2. 必须包含 COUNT 关键词（防止误传列表查询 SQL）
+            3. 不能含有写操作关键词
+        查询失败返回 -1，调用方可据此判断是否出错。
+        """
+        stripped = sql.strip()
+
+        # 校验必须含 COUNT
+        if not re.search(r'\bCOUNT\b', stripped, re.IGNORECASE):
+            logger.error(f"[job_repo] 统计查询校验失败：SQL 中未找到 COUNT，SQL: {stripped[:60]}")
+            return -1
+
+        try:
+            _validate_sql(stripped)   # 复用通用安全校验
+        except ValueError as e:
+            logger.error(f"[job_repo] {e}")
+            return -1
+
+        try:
+            with self._db._session() as session:
+                row = session.execute(text(stripped)).fetchone()
+                # COUNT 查询结果取第一列第一行
+                total = int(row[0]) if row else 0
+                logger.info(f"[job_repo] execute_count_query 结果: {total}")
+                return total
+        except Exception as e:
+            logger.error(f"[job_repo] 统计查询执行失败: {e} | SQL: {stripped[:200]}")
+            return -1
+
     # ── 招聘者：按职位查询候选人 ─────────────────
 
     def get_candidates_by_job(self, job_id: int) -> list[dict]:

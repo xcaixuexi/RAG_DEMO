@@ -121,14 +121,17 @@ class Supervisor:
                 return query, intent
 
         # ── Level-2：LLM 路由 ─────────────────────────
-        rewritten = self.query_rewrite(query)
-        intent = self.query_router(rewritten)
+        # rewritten = self.query_rewrite(query)
+        # intent = self.query_router(rewritten)
+        intent = self.query_router(query)
         self.stats["llm_hit"] += 1
         logger.info(
-            f"[LLM路由命中] '{query}' → rewrite='{rewritten}' → {intent} "
+            # f"[LLM路由命中] '{query}' → rewrite='{rewritten}' → {intent} "
+            f"[LLM路由命中] '{query}' → {intent} "
             f"(LLM命中率: {self._llm_hit_rate():.1%})"
         )
-        return rewritten, intent
+        # return rewritten, intent
+        return query, intent
 
     def get_stats(self) -> dict:
         """返回当前命中率统计，供监控/日志使用"""
