@@ -92,32 +92,32 @@ def _row_to_job_dict(row) -> dict:
 def _row_to_apply_dict(row) -> dict:
     """将三表 JOIN 的 Row 对象转为候选人完整字典，含状态中文映射"""
     def _fmt_dt(dt):
-        return dt.strftime("%Y-%m-%d %H:%M") if dt else ""
+        return dt.strftime("%Y-%m-%d %H:%M") if dt else None
 
-    status    = row.status
+    status     = row.status
     audit_type = row.audit_type
-    emp_way   = getattr(row, "emp_way", None)
+    emp_way    = getattr(row, "emp_way", None)
 
     return {
-        "apply_id":        row.apply_id,
-        "user_id":         row.user_id,
-        "resume_id":       row.resume_id,
-        "job_id":          row.job_id,
-        "job_name":        row.job_name      or "",
-        "company_id":      row.company_id,
-        "company_name":    row.company_name  or "",
-        "expected_salary": float(row.expected_salary) if row.expected_salary else None,
-        "status":          status,
-        "status_label":    _STATUS_MAP.get(status, str(status)),
-        "audit_type":      audit_type,
-        "audit_type_label":_AUDIT_TYPE_MAP.get(audit_type, str(audit_type)),
-        "emp_way":         emp_way,
-        "emp_way_label":   _EMP_WAY_MAP.get(emp_way, "") if emp_way is not None else "",
-        "create_time":     _fmt_dt(row.create_time),
-        "audit_time":      _fmt_dt(row.audit_time),
-        "cancel_time":     _fmt_dt(getattr(row, "cancel_time", None)),
-        "remark":          getattr(row, "remark", "") or "",
-        "reason":          getattr(row, "reason", "") or "",
+        "apply_id":         row.apply_id,
+        "user_id":          row.user_id,
+        "resume_id":        row.resume_id or None,
+        "job_id":           row.job_id,
+        "job_name":         row.job_name      or "",
+        "company_id":       row.company_id,
+        "company_name":     row.company_name  or "",
+        "expected_salary":  float(row.expected_salary) if row.expected_salary else None,
+        "status":           status,
+        "status_label":     _STATUS_MAP.get(status),
+        "audit_type":       audit_type,
+        "audit_type_label": _AUDIT_TYPE_MAP.get(audit_type),
+        "emp_way":          emp_way,
+        "emp_way_label":    _EMP_WAY_MAP.get(emp_way),
+        "create_time":      _fmt_dt(row.create_time),
+        "audit_time":       _fmt_dt(row.audit_time),
+        "cancel_time":      _fmt_dt(getattr(row, "cancel_time", None)),
+        "remark":           getattr(row, "remark", None) or None,
+        "reason":           getattr(row, "reason", None) or None,
     }
 
 

@@ -3,15 +3,14 @@ match_agent.py — 职位匹配 Agent
 
 两级业务逻辑：
     求职者（jobseeker）：
-        用户描述需求 → LLM 提取条件生成 SQL → 查询 job 表 → 返回职位列表
+        用户描述需求 → LLM 同时生成 count_sql + list_sql → 并行执行 → 返回总数和职位列表
         无结果时 → LLM 生成友好引导语
 
     招聘者（recruiter）：
-        用户描述职位 → LLM 提取 job_id 或职位名 → 查询 employees_apply → 返回候选人列表
+        用户描述职位 → LLM 同时生成 count_sql + list_sql → 并行执行 → 返回总数和候选人列表
 
 安全约定：
-    LLM 生成的 SQL 经 job_repo.execute_job_query 校验，
-    只允许 SELECT，禁止任何写操作关键词。
+    LLM 生成的 SQL 经 job_repo 校验，只允许 SELECT，禁止任何写操作关键词。
 """
 
 import json
@@ -34,12 +33,12 @@ logger = logging.getLogger(__name__)
 
 # 求职者：提取查询条件，生成 SQL
 _JOBSEEKER_SQL_SYSTEM = """你是一个招聘数据库查询助手。
-根据用户的自然语言需求，生成一条查询 job 表的 SQL 语句。
+根据用户的自然语言需求，同时生成两条查询 job 表的 SQL 语句。
 
 表名：job
 可用查询字段：
-    name        VARCHAR  职位名称，用 LIKE 模糊匹配
-    work_city   VARCHAR  工作城市，用 LIKE 模糊匹配
+    name        VARCHAR  职位名称，用 LIKE '%xxx%' 模糊匹配
+    work_city   VARCHAR  工作城市，用 LIKE '%xxx%' 模糊匹配
     salary_min  INT      最低薪资（元/月）
     salary_max  INT      最高薪资（元/月）
     salary      VARCHAR  薪资范围，值域：面议/3k以下/3k-5k/5k-8k/8k-12k/12k-15k/15k-20k/20k以上
@@ -47,32 +46,34 @@ _JOBSEEKER_SQL_SYSTEM = """你是一个招聘数据库查询助手。
     education   VARCHAR  学历要求，值域：不限/大专/本科/硕士/博士
     job_type    TINYINT  职位类型：0全职 1就业 2实习 3临时工
 
-查询类型区分：
-    - 列表查询：用户想看职位列表、找职位、推荐职位
-      → 使用固定 SELECT 字段 + LIMIT 20
-      → type 字段填 "list"
-    - 统计查询：用户询问数量、有多少、统计等
-      → 只输出 SELECT COUNT(*) AS total FROM job WHERE ...（不加 LIMIT）
-      → type 字段填 "count"
-
 多条件规则：
     - 用户提到多个条件时，所有条件用 AND 连接，不要只取其中一个
-    - 例如用户说"xx城市的电工招聘情况"
-      → WHERE work_city LIKE '%xx%' AND name LIKE '%电工%'
-    - 例如用户说"深圳地区5年经验的开发职位"
-      → WHERE work_city='深圳' AND job_exp='5-10年'
     - 条件之间是并列关系，不要丢弃任何一个明确提到的条件
+    - 职位类型（全职/实习/临时工等）用 job_type 字段匹配，不要用 name LIKE
+
+    示例1：用户说"东莞地区的临时工职位"
+      → WHERE work_city LIKE '%东莞%' AND job_type=3
+    示例2：用户说"深圳5年经验的开发职位"
+      → WHERE work_city LIKE '%深圳%' AND job_exp='5-10年' AND name LIKE '%开发%'
+    示例3：用户说"本科学历15k以上的产品经理"
+      → WHERE education='本科' AND salary_min>=15000 AND name LIKE '%产品经理%'
 
 固定规则：
     1. WHERE 条件必须包含 status=1 AND is_delete=0 AND audit_status=1
     2. 条件不确定时宁可不加，不要强行猜测
-    3. 列表查询 SELECT 字段固定为：id, name, company_name, company_logo, salary, salary_min, salary_max, job_exp, education, job_type, job_duty, work_city, contact_name, contact_phone, welfare
+    3. list_sql 必须加 LIMIT 50
+    4. count_sql 不加 LIMIT
+    5. list_sql SELECT 字段固定为：
+       id, name, company_name, company_logo, salary, salary_min, salary_max,
+       job_exp, education, job_type, job_duty, work_city,
+       contact_name, contact_phone, welfare
+    6. count_sql 固定为：SELECT COUNT(*) AS total FROM job WHERE ...
 
 只输出 JSON，不输出任何其他文字，格式：
 {{
-    "type": "list",
-    "sql": "完整的 SELECT 语句",
-    "message": "一句话说明搜索意图，如：为您搜索深圳3-5年经验的Python开发职位"
+    "count_sql": "SELECT COUNT(*) AS total FROM job WHERE ...",
+    "list_sql": "SELECT id, name, ... FROM job WHERE ... LIMIT 20",
+    "message": "一句话说明搜索意图"
 }}"""
 
 # 求职者：无结果时引导
@@ -80,9 +81,9 @@ _NO_RESULT_SYSTEM = """你是一个友好的招聘助手。
 用户搜索职位无结果，请给出简短、友好的建议，引导用户放宽条件重试。
 回复控制在 50 字以内，不用列条目，一段话即可。"""
 
-# 招聘者：三表 JOIN 版本，支持列表和统计两种查询
+# 招聘者：提取查询条件，生成 SQL
 _RECRUITER_EXTRACT_SYSTEM = """你是一个招聘数据库查询助手。
-根据招聘者的问题，提取查询条件生成 SQL。
+根据招聘者的问题，同时生成两条 SQL 语句。
 
 涉及的表：
     employees_apply（报名表，别名 ea）
@@ -101,28 +102,16 @@ _RECRUITER_EXTRACT_SYSTEM = """你是一个招聘数据库查询助手。
     期望薪资：ea.expected_salary
     报名方式：ea.emp_way（0自主 1代替）
 
-查询类型区分：
-    - 列表查询：查看候选人列表、报名记录
-      → 使用固定 SELECT 字段 + LIMIT 50 + ORDER BY ea.create_time DESC
-      → type 字段填 "list"
-    - 统计查询：询问报名人数、有多少候选人、统计等
-      → SELECT COUNT(*) AS total FROM employees_apply ea LEFT JOIN job j ON ea.job_id = j.id LEFT JOIN company c ON ea.company_id = c.id WHERE ...
-      → type 字段填 "count"
-
 多条件规则：
     - 用户提到多个条件时，所有条件用 AND 连接，不要只取其中一个
-    - 例如用户说"xxx公司的Python开发报名情况"
-      → WHERE ea.company_id对应条件 AND ea.job_id对应条件
-    - 例如用户说"深圳地区5年经验的开发职位"
-      → WHERE work_city='深圳' AND job_exp='5-10年'
     - 条件之间是并列关系，不要丢弃任何一个明确提到的条件
 
-固定规则（列表查询）：
+固定规则：
     1. ea.status != 5（过滤已取消报名）
-    2. LIMIT 50
-    3. ORDER BY ea.create_time DESC
+    2. list_sql 加 ORDER BY ea.create_time DESC 和 LIMIT 50
+    3. count_sql 不加 LIMIT
 
-列表查询 SELECT 固定字段：
+list_sql 固定 SELECT 字段：
     ea.id as apply_id,
     ea.user_id,
     ea.resume_id,
@@ -140,10 +129,16 @@ _RECRUITER_EXTRACT_SYSTEM = """你是一个招聘数据库查询助手。
     ea.remark,
     ea.reason
 
-只输出 JSON，格式：
+count_sql 固定为：
+    SELECT COUNT(*) AS total FROM employees_apply ea
+    LEFT JOIN job j ON ea.job_id = j.id
+    LEFT JOIN company c ON ea.company_id = c.id
+    WHERE ea.status != 5 AND ...
+
+只输出 JSON，不输出任何其他文字，格式：
 {{
-    "type": "list",
-    "sql": "完整 SELECT 语句",
+    "count_sql": "SELECT COUNT(*) AS total FROM ...",
+    "list_sql": "SELECT ea.id as apply_id, ... LIMIT 50",
     "message": "一句话说明查询意图"
 }}"""
 
@@ -183,64 +178,54 @@ def _parse_json_safe(text: str) -> Optional[dict]:
 def _handle_jobseeker(query: str, llm: ChatOpenAI, repo: JobRepo) -> dict:
     """
     求职者流程：
-        1. LLM 提取条件生成 SQL，返回 type（list/count）
-        2. count → execute_count_query，返回数量
-           list  → execute_job_query，返回职位列表；无结果时 LLM 生成引导语
+        LLM 同时生成 count_sql + list_sql
+        → 并行执行：count_query 取总数，job_query 取列表
+        → 统一返回 {total, jobs, message}
     """
-    raw = _llm_call(llm, _JOBSEEKER_SQL_SYSTEM, query)
+    raw    = _llm_call(llm, _JOBSEEKER_SQL_SYSTEM, query)
     parsed = _parse_json_safe(raw)
 
-    if parsed is None or "sql" not in parsed:
-        logger.error("[match_agent] LLM 未返回有效 SQL JSON")
+    if parsed is None or "count_sql" not in parsed or "list_sql" not in parsed:
+        logger.error(f"[match_agent] 求职者 LLM 返回格式异常: {raw[:200]}")
         return _error_response("条件解析失败，请重新描述您的需求")
 
-    sql       = parsed["sql"]
-    hint      = parsed.get("message", "正在为您搜索匹配职位")
-    query_type = parsed.get("type", "list")
+    count_sql = parsed["count_sql"]
+    list_sql  = parsed["list_sql"]
+    message   = parsed.get("message", "为您搜索匹配职位")
 
-    logger.info(f"[match_agent] 求职者 SQL (type={query_type}): {sql}")
+    logger.info(f"[match_agent] 求职者 count_sql: {count_sql}")
+    logger.info(f"[match_agent] 求职者 list_sql:  {list_sql}")
 
-    # ── 统计查询分支 ──────────────────────────
-    if query_type == "count":
-        total = repo.execute_count_query(sql)
-        if total < 0:
-            return _error_response("统计查询失败，请稍后重试")
-        return {
-            "intent": "job_match",
-            "data": {
-                "total":   total,
-                "message": f"{hint}，共有 {total} 个符合条件的职位",
-            },
-            "status": "success",
-        }
+    total = repo.execute_count_query(count_sql)
+    jobs  = repo.execute_job_query(list_sql)
 
-    # ── 列表查询分支 ──────────────────────────
-    jobs = repo.execute_job_query(sql)
-
-    if jobs:
+    # count 执行失败（返回 -1）降级为列表长度
+    if total < 0:
         total = len(jobs)
-        return {
-            "intent": "job_match",
-            "data": {
-                "jobs":    jobs,
-                "total":   total,
-                "message": f"{hint}，为您找到 {total} 个匹配职位",
-            },
-            "status": "success",
-        }
 
     # 无结果，LLM 生成引导语
-    guide = _llm_call(
-        llm,
-        _NO_RESULT_SYSTEM,
-        f"用户查询：{query}\n搜索条件：{hint}",
-    )
+    if not jobs:
+        guide = _llm_call(
+            llm,
+            _NO_RESULT_SYSTEM,
+            f"用户查询：{query}\n搜索条件：{message}",
+        )
+        return {
+            "intent": "job_match",
+            "data": {
+                "total":   0,
+                "jobs":    [],
+                "message": guide,
+            },
+            "status": "success",
+        }
+    
     return {
         "intent": "job_match",
         "data": {
-            "jobs":    [],
-            "total":   0,
-            "message": guide,
+            "total":   total,
+            "jobs":    jobs,
+            "message": f"{message}，共找到 {total} 个职位",
         },
         "status": "success",
     }
@@ -249,47 +234,37 @@ def _handle_jobseeker(query: str, llm: ChatOpenAI, repo: JobRepo) -> dict:
 def _handle_recruiter(query: str, llm: ChatOpenAI, repo: JobRepo) -> dict:
     """
     招聘者流程：
-        1. LLM 根据自然语言生成三表 JOIN SQL，返回 type（list/count）
-        2. count → execute_count_query，返回报名人数
-           list  → execute_apply_query，返回候选人完整列表
+        LLM 同时生成 count_sql + list_sql
+        → 并行执行：count_query 取总报名数，apply_query 取候选人列表
+        → 统一返回 {total, candidates, message}
     """
-    raw = _llm_call(llm, _RECRUITER_EXTRACT_SYSTEM, query)
+    raw    = _llm_call(llm, _RECRUITER_EXTRACT_SYSTEM, query)
     parsed = _parse_json_safe(raw)
 
-    if parsed is None or "sql" not in parsed:
+    if parsed is None or "count_sql" not in parsed or "list_sql" not in parsed:
+        logger.error(f"[match_agent] 招聘者 LLM 返回格式异常: {raw[:200]}")
         return _error_response("意图解析失败，请描述您想查询哪个职位的候选人")
 
-    sql        = parsed["sql"]
-    hint       = parsed.get("message", "查询候选人")
-    query_type = parsed.get("type", "list")
+    count_sql = parsed["count_sql"]
+    list_sql  = parsed["list_sql"]
+    message   = parsed.get("message", "查询候选人")
 
-    logger.info(f"[match_agent] 招聘者 SQL (type={query_type}): {sql}")
+    logger.info(f"[match_agent] 招聘者 count_sql: {count_sql}")
+    logger.info(f"[match_agent] 招聘者 list_sql:  {list_sql}")
 
-    # ── 统计查询分支 ──────────────────────────
-    if query_type == "count":
-        total = repo.execute_count_query(sql)
-        if total < 0:
-            return _error_response("统计查询失败，请稍后重试")
-        return {
-            "intent": "job_match",
-            "data": {
-                "total":   total,
-                "message": f"{hint}，共有 {total} 条报名记录",
-            },
-            "status": "success",
-        }
+    total      = repo.execute_count_query(count_sql)
+    candidates = repo.execute_apply_query(list_sql)
 
-    # ── 列表查询分支 ──────────────────────────
-    candidates = repo.execute_apply_query(sql)
-    total      = len(candidates)
-    message    = f"{hint}，共找到 {total} 条报名记录" if total else "暂无符合条件的报名记录"
+    # count 执行失败（返回 -1）降级为列表长度
+    if total < 0:
+        total = len(candidates)
 
     return {
         "intent": "job_match",
         "data": {
-            "candidates": candidates,
             "total":      total,
-            "message":    message,
+            "candidates": candidates,
+            "message":    f"{message}，共 {total} 条记录",
         },
         "status": "success",
     }
