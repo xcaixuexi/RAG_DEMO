@@ -3,8 +3,8 @@ chat_controller.py — 对话控制器
 
 职责：
     1. 持有 Supervisor 实例，调用两级路由（规则层 + LLM 层）
-    2. 接收并存储 user_role / user_id，透传给所有 Agent
-    3. 管理多轮对话历史（仅 chitchat 意图，最多保留 3 轮），history 每条携带 user_role
+    2. 接收并存储 user_role / user_id / session_id，透传给所有 Agent
+    3. 历史管理委托给 session_manager，通过 _get_history / _append_history 读写
     4. 提供 process_message（文本对话）和 process_file（文件上传）两个入口
     5. 将 Agent 返回的统一响应字典透传给 View 层
 """
@@ -20,11 +20,9 @@ from rag_modules.agents import (
     chitchat_agent,
     unknown_agent,
 )
+from controller import session_manager
 
 logger = logging.getLogger(__name__)
-
-# chitchat 保留的最大轮数（1轮 = 用户1条 + 助手1条）
-_MAX_HISTORY_TURNS = 3
 
 
 class ChatController:
@@ -42,15 +40,22 @@ class ChatController:
         调用对应 Agent，返回统一响应字典
     """
 
-    def __init__(self, user_role: str = "jobseeker", user_id: int = 0):
+    def __init__(
+        self,
+        user_role:  str = "jobseeker",
+        user_id:    int = 0,
+        session_id: str = "",
+    ):
         """
         Args:
-            user_role: 当前用户角色，透传给所有 Agent。
-                       可选值："recruiter" / "jobseeker" / "admin"
-            user_id:   当前登录用户的系统 ID，透传给 Agent，供后续业务扩展使用
+            user_role:  当前用户角色，透传给所有 Agent。
+                        可选值："recruiter" / "jobseeker" / "admin"
+            user_id:    当前登录用户的系统 ID，透传给 Agent，供后续业务扩展使用
+            session_id: 前端生成的会话 UUID，用于读写 session_manager 中的历史
         """
-        self.user_role = user_role
-        self.user_id   = user_id
+        self.user_role  = user_role
+        self.user_id    = user_id
+        self.session_id = session_id
         self._pending_file_path = None   # CLI 场景暂存待解析的文件路径
 
         self.supervisor = Supervisor(
@@ -59,9 +64,6 @@ class ChatController:
             enable_rule_router=True,
         )
 
-        # chitchat 多轮历史：deque 自动滚动，maxlen = 轮数 × 2（user + assistant）
-        self._chitchat_history: deque[dict] = deque(maxlen=_MAX_HISTORY_TURNS * 2)
-
         self._agent_map = {
             "resume_parse": self._call_resume,
             "job_match":    self._call_match,
@@ -69,6 +71,19 @@ class ChatController:
             "chitchat":     self._call_chitchat,
             "unknown":      self._call_unknown,
         }
+
+    # ==================== 历史读写 ====================
+
+    def _get_history(self, agent_type: str) -> list[dict]:
+        """从 session_manager 读取指定 agent 的历史"""
+        return session_manager.get_history(self.session_id, agent_type)
+
+    def _append_history(self, agent_type: str, query: str, reply: str) -> None:
+        """
+        向 session_manager 追加一轮对话。
+        match 场景只传 message 摘要，不传 jobs/candidates 列表。
+        """
+        session_manager.append_history(self.session_id, agent_type, query, reply)
 
     # ==================== 对外主接口 ====================
 
@@ -84,7 +99,7 @@ class ChatController:
         """
         try:
             processed_query, intent = self.supervisor.route(user_input)
-            handler = self._agent_map.get(intent, self._call_unknown)
+            handler  = self._agent_map.get(intent, self._call_unknown)
             response = handler(processed_query)
         except Exception as e:
             logger.error(f"处理消息时出错: {e}")
@@ -98,6 +113,7 @@ class ChatController:
     def process_file(self, file_path: str) -> dict:
         """
         处理文件上传（简历解析），直接调用 resume_agent，跳过路由。
+        resume_agent 每次独立分析，不读写历史。
 
         Args:
             file_path: 上传文件的本地路径（.pdf 或 .docx）
@@ -123,43 +139,60 @@ class ChatController:
         return response
 
     def get_routing_stats(self) -> dict:
-        """
-        获取路由命中率统计（供监控 / 日志 / 管理面板使用）。
-
-        Returns:
-            {"total": N, "rule_hit": N, "llm_hit": N, "rule_hit_rate": 0.xx, ...}
-        """
+        """获取路由命中率统计"""
         return self.supervisor.get_stats()
 
-    def clear_history(self):
-        """清空 chitchat 多轮历史（如用户主动开启新话题时调用）"""
-        self._chitchat_history.clear()
-        logger.info("chitchat 历史已清空")
+    def clear_history(self, agent_type: str = None) -> None:
+        """
+        清空历史。
+        agent_type 为 None 时清除该 session 所有 agent 的历史。
+        """
+        if agent_type:
+            session_manager.clear_agent(self.session_id, agent_type)
+        else:
+            session_manager.clear_session(self.session_id)
+        logger.info(f"历史已清空: session={self.session_id} agent={agent_type or 'all'}")
 
     # ==================== 各 Agent 调用封装 ====================
 
     def _call_chitchat(self, query: str) -> dict:
         """调用 chitchat_agent，传入历史、llm 实例和 user_role。"""
-        history = list(self._chitchat_history)
-
+        history  = self._get_history("chitchat")
         response = chitchat_agent.handle(
             query     = query,
             history   = history,
             llm       = self.supervisor.llm,
             user_role = self.user_role,
         )
+        self._append_history("chitchat", query, response["data"]["message"])
+        return response
 
-        # 追加本轮到历史，每条带上 user_role 备用
-        self._chitchat_history.append({
-            "role":      "user",
-            "content":   query,
-            "user_role": self.user_role,
-        })
-        self._chitchat_history.append({
-            "role":      "assistant",
-            "content":   response["data"]["message"],
-            "user_role": self.user_role,
-        })
+    def _call_knowledge(self, query: str) -> dict:
+        """调用 knowledge_agent，传入历史和 llm。"""
+        history  = self._get_history("knowledge")
+        response = knowledge_agent.handle(
+            query     = query,
+            user_role = self.user_role,
+            history   = history,
+            llm       = self.supervisor.llm,
+        )
+        self._append_history("knowledge", query, response["data"]["message"])
+        return response
+
+    def _call_match(self, query: str) -> dict:
+        """
+        调用 match_agent，传入历史和 llm。
+        存历史时只存 message 摘要，不存 jobs/candidates 列表。
+        """
+        history  = self._get_history("match")
+        response = match_agent.handle(
+            query     = query,
+            user_role = self.user_role,
+            history   = history,
+            llm       = self.supervisor.llm,
+        )
+        # 只取 message 字段存历史，不存 jobs/candidates
+        self._append_history("match", query, response["data"]["message"])
         return response
 
     def _call_resume(self, query: str) -> dict:
@@ -177,22 +210,6 @@ class ChatController:
             "data":   {"message": "请上传您的简历文件（支持 .pdf 和 .docx 格式），我来为您解析。"},
             "status": "success",
         }
-
-    def _call_match(self, query: str) -> dict:
-        return match_agent.handle(
-            query     = query,
-            user_role = self.user_role,
-            history   = [],
-            llm       = self.supervisor.llm,
-        )
-
-    def _call_knowledge(self, query: str) -> dict:
-        return knowledge_agent.handle(
-            query     = query,
-            user_role = self.user_role,
-            history   = [],
-            llm       = self.supervisor.llm,
-        )
 
     def _call_unknown(self, query: str) -> dict:
         return unknown_agent.handle(

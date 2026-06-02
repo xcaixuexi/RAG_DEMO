@@ -4,7 +4,6 @@ match_agent.py — 职位匹配 Agent
 两级业务逻辑：
     求职者（jobseeker）：
         用户描述需求 → LLM 同时生成 count_sql + list_sql → 并行执行 → 返回总数和职位列表
-        无结果时 → LLM 生成友好引导语
 
     招聘者（recruiter）：
         用户描述职位 → LLM 同时生成 count_sql + list_sql → 并行执行 → 返回总数和候选人列表
@@ -72,7 +71,7 @@ _JOBSEEKER_SQL_SYSTEM = """你是一个招聘数据库查询助手。
 只输出 JSON，不输出任何其他文字，格式：
 {{
     "count_sql": "SELECT COUNT(*) AS total FROM job WHERE ...",
-    "list_sql": "SELECT id, name, ... FROM job WHERE ... LIMIT 20",
+    "list_sql": "SELECT id, name, ... FROM job WHERE ... LIMIT 50",
     "message": "一句话说明搜索意图"
 }}"""
 
@@ -147,13 +146,28 @@ count_sql 固定为：
 # LLM 工具函数
 # ─────────────────────────────────────────────
 
-def _llm_call(llm: ChatOpenAI, system: str, user_content: str) -> str:
-    """封装单次 LLM 调用，返回字符串"""
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", system),
-        ("human",  "{input}"),
-    ])
-    chain = prompt | llm | StrOutputParser()
+def _llm_call(
+    llm:          ChatOpenAI,
+    system:       str,
+    user_content: str,
+    history:      Optional[list[dict]] = None,
+) -> str:
+    """
+    封装 LLM 调用，支持多轮历史上下文。
+
+    Args:
+        history: [{"role": "user"|"assistant", "content": "..."}] 格式的历史列表
+    """
+    history = history or []
+
+    # 拼装消息：system + history + 当前用户输入
+    messages = [("system", system)]
+    for turn in history:
+        messages.append((turn["role"], turn["content"]))
+    messages.append(("human", "{input}"))
+
+    prompt = ChatPromptTemplate.from_messages(messages)
+    chain  = prompt | llm | StrOutputParser()
     return chain.invoke({"input": user_content}).strip()
 
 
@@ -175,14 +189,14 @@ def _parse_json_safe(text: str) -> Optional[dict]:
 # 业务分支
 # ─────────────────────────────────────────────
 
-def _handle_jobseeker(query: str, llm: ChatOpenAI, repo: JobRepo) -> dict:
+def _handle_jobseeker(query: str, llm: ChatOpenAI, repo: JobRepo, history: list) -> dict:
     """
     求职者流程：
         LLM 同时生成 count_sql + list_sql
         → 并行执行：count_query 取总数，job_query 取列表
         → 统一返回 {total, jobs, message}
     """
-    raw    = _llm_call(llm, _JOBSEEKER_SQL_SYSTEM, query)
+    raw    = _llm_call(llm, _JOBSEEKER_SQL_SYSTEM, query, history)
     parsed = _parse_json_safe(raw)
 
     if parsed is None or "count_sql" not in parsed or "list_sql" not in parsed:
@@ -203,7 +217,7 @@ def _handle_jobseeker(query: str, llm: ChatOpenAI, repo: JobRepo) -> dict:
     if total < 0:
         total = len(jobs)
 
-    # 无结果，LLM 生成引导语
+    # 无结果时 LLM 生成友好引导语
     if not jobs:
         guide = _llm_call(
             llm,
@@ -219,7 +233,7 @@ def _handle_jobseeker(query: str, llm: ChatOpenAI, repo: JobRepo) -> dict:
             },
             "status": "success",
         }
-    
+
     return {
         "intent": "job_match",
         "data": {
@@ -231,14 +245,14 @@ def _handle_jobseeker(query: str, llm: ChatOpenAI, repo: JobRepo) -> dict:
     }
 
 
-def _handle_recruiter(query: str, llm: ChatOpenAI, repo: JobRepo) -> dict:
+def _handle_recruiter(query: str, llm: ChatOpenAI, repo: JobRepo, history: list) -> dict:
     """
     招聘者流程：
         LLM 同时生成 count_sql + list_sql
         → 并行执行：count_query 取总报名数，apply_query 取候选人列表
         → 统一返回 {total, candidates, message}
     """
-    raw    = _llm_call(llm, _RECRUITER_EXTRACT_SYSTEM, query)
+    raw    = _llm_call(llm, _RECRUITER_EXTRACT_SYSTEM, query, history)
     parsed = _parse_json_safe(raw)
 
     if parsed is None or "count_sql" not in parsed or "list_sql" not in parsed:
@@ -294,7 +308,8 @@ def handle(
     Args:
         query:     用户输入
         user_role: "jobseeker" → 查职位；"recruiter" → 查候选人
-        history:   多轮历史（预留，暂未使用）
+        history:   多轮对话历史，由 ChatController 从 session_manager 传入，最多 5 轮。
+                   只包含用户提问和简短摘要，不包含 jobs/candidates 列表。
         llm:       ChatOpenAI 实例，由 ChatController 从 Supervisor 传入
 
     Returns:
@@ -309,6 +324,6 @@ def handle(
     repo = JobRepo()
 
     if user_role == "recruiter":
-        return _handle_recruiter(query, llm, repo)
+        return _handle_recruiter(query, llm, repo, history)
     else:
-        return _handle_jobseeker(query, llm, repo)
+        return _handle_jobseeker(query, llm, repo, history)

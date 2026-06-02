@@ -61,21 +61,26 @@ def handle(
     Args:
         query:     用户问题
         user_role: 用户角色（预留，暂不用于分支）
-        history:   多轮历史（不需要，保留签名一致性）
+        history:   多轮对话历史，由 ChatController 从 session_manager 传入，最多 5 轮
         llm:       ChatOpenAI 实例，由 ChatController 从 Supervisor 传入
 
     Returns:
         统一响应字典：{"intent": "knowledge", "data": {"message": "..."}, "status": "success"}
     """
+    history = history or []
+
     if llm is None:
         logger.error("[knowledge_agent] llm 未传入")
         return _build_response("系统配置错误，请联系管理员", status="error")
 
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", _SYSTEM_PROMPT),
-        ("human",  "{query}"),
-    ])
-    chain = prompt | llm | StrOutputParser()
+    # 拼装消息列表：system + history + 当前问题
+    messages = [("system", _SYSTEM_PROMPT)]
+    for turn in history:
+        messages.append((turn["role"], turn["content"]))
+    messages.append(("human", "{query}"))
+
+    prompt = ChatPromptTemplate.from_messages(messages)
+    chain  = prompt | llm | StrOutputParser()
 
     try:
         answer = chain.invoke({"query": query}).strip()

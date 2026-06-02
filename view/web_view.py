@@ -40,9 +40,10 @@ app.add_middleware(
 # ─────────────────────────────────────────────
 
 class ChatRequest(BaseModel):
-    user_id:   int
-    user_role: str   # recruiter | jobseeker
-    message:   str
+    user_id:    int
+    user_role:  str   # recruiter | jobseeker
+    session_id: str = "3a7b9f2c-8d4e-4a1b-9c6d-7e8f2a1b3c4d"                 # 前端生成的 UUID，用于关联历史会话
+    message:    str
 
 
 # ─────────────────────────────────────────────
@@ -53,14 +54,15 @@ class ChatRequest(BaseModel):
 async def chat(request: ChatRequest) -> dict:
     """
     文字对话接口。
-
-    每次请求独立初始化 ChatController（无状态，user_role/user_id 从请求体取）。\n
+    每次请求独立初始化 ChatController\n
     recruiter 招聘者\n
-    jobseeker 求职者
+    jobseeker 求职者\n
+    session_id 对话id
     """
     controller = ChatController(
-        user_role=request.user_role,
-        user_id=request.user_id,
+        user_role  = request.user_role,
+        user_id    = request.user_id,
+        session_id = request.session_id,
     )
     response = controller.process_message(request.message)
     return response
@@ -68,9 +70,10 @@ async def chat(request: ChatRequest) -> dict:
 
 @app.post("/api/file/upload")
 async def upload_file(
-    file:      UploadFile = File(...),
-    user_id:   int        = Form(...),
-    user_role: str        = Form("recruiter"),
+    file:       UploadFile = File(...),
+    user_id:    int        = Form(...),
+    user_role:  str        = Form("recruiter"),
+    session_id: str        = Form(...),
 ) -> dict:
     """
     简历文件上传解析接口。
@@ -88,17 +91,20 @@ async def upload_file(
         )
 
     # 保存临时文件
-    safe_name   = f"{user_id}_{int(time.time())}_{file.filename}"
-    temp_path   = UPLOAD_DIR / safe_name
+    safe_name = f"{user_id}_{int(time.time())}_{file.filename}"
+    temp_path = UPLOAD_DIR / safe_name
 
     try:
         content = await file.read()
         temp_path.write_bytes(content)
         logger.info(f"临时文件已保存: {temp_path}（{len(content)} bytes）")
 
-        # 调用 Controller 解析
-        controller = ChatController(user_role=user_role, user_id=user_id)
-        response   = controller.process_file(str(temp_path))
+        controller = ChatController(
+            user_role  = user_role,
+            user_id    = user_id,
+            session_id = session_id,
+        )
+        response = controller.process_file(str(temp_path))
 
     except HTTPException:
         raise
@@ -106,7 +112,6 @@ async def upload_file(
         logger.error(f"文件处理失败: {e}")
         raise HTTPException(status_code=500, detail="文件处理失败，请稍后重试")
     finally:
-        # 无论成功与否，临时文件都要清理
         if temp_path.exists():
             temp_path.unlink()
             logger.info(f"临时文件已删除: {temp_path}")
@@ -116,12 +121,6 @@ async def upload_file(
 
 @app.get("/api/stats")
 async def stats() -> dict:
-    """
-    路由命中率统计接口（用于监控规则路由效果）。
-
-    注意：每次请求会新建一个 Controller，stats 从 0 开始——
-    生产环境若需全局统计，应将 Supervisor 改为单例。
-    当前阶段用于开发调试。
-    """
-    controller = ChatController()
+    """路由命中率统计接口（开发调试用）"""
+    controller = ChatController(session_id="__stats__")
     return controller.get_routing_stats()
