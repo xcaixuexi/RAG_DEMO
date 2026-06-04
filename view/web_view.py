@@ -40,7 +40,7 @@ app.add_middleware(
 # ─────────────────────────────────────────────
 
 class ChatRequest(BaseModel):
-    user_id:    int
+    user_id:    int = 161102110337
     user_role:  str   # recruiter | jobseeker
     session_id: str = "3a7b9f2c-8d4e-4a1b-9c6d-7e8f2a1b3c4d"                 # 前端生成的 UUID，用于关联历史会话
     message:    str

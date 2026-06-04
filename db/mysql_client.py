@@ -2,8 +2,7 @@
 db/mysql_client.py — MySQL 连接与查询操作封装
 
 连接目标：192.168.110.8:3306 / dcz_ai
-只读查询，不做任何写入操作，供 match_agent 等 Agent 使用。
-
+只读查询，不做任何写入操作。
 """
 
 import os
@@ -74,11 +73,28 @@ class MySQLClient:
     # ── 企业查询 ──────────────────────────────
 
     def get_company(self, company_id: int) -> Optional[Company]:
-        """按 id 查询企业（apply_status=1 表示已通过审核）"""
+        """按 id 查询企业"""
         with self._session() as s:
             return (
                 s.query(Company)
                 .filter(Company.id == company_id, Company.is_delete == 0)
+                .first()
+            )
+
+    def get_company_by_user_id(self, user_id: int) -> Optional[Company]:
+        """
+        根据申请人 user_id 查询企业。
+        需满足 is_delete=0 且 apply_status=1（已通过审核）。
+        供控制器层获取招聘者关联的 company_id 使用。
+        """
+        with self._session() as s:
+            return (
+                s.query(Company)
+                .filter(
+                    Company.user_id    == user_id,
+                    Company.is_delete  == 0,
+                    Company.apply_status == 1,
+                )
                 .first()
             )
 
@@ -138,7 +154,7 @@ class MySQLClient:
     def search_jobs(self, keyword: str) -> list[Job]:
         """
         按关键词模糊搜索职位（职位名称 + 工作职责 + 职位要求）。
-        供 match_agent 根据用户 JD 描述检索相关职位使用。
+        供 job_search_agent 根据用户 JD 描述检索相关职位使用。
         """
         with self._session() as s:
             like = f"%{keyword}%"

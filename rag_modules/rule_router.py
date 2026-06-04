@@ -1,28 +1,23 @@
 """
 rule_router.py — 基于关键词/正则的规则快速路由层
 
-设计目标：
-    在调用 LLM 之前，对高频、意图明确的用户输入直接命中路由意图，
-    完全跳过 query_rewrite + query_router 两次 LLM 调用，节省 Token 资源。
-
 路由优先级（从高到低）：
     1. 否定保护 (NegationGuard)  — 含"不要/别/取消"等否定词时直接放行给 LLM
     2. resume_parse              — 简历解析类
-    3. job_match                 — 岗位匹配/人才推荐类
-    4. knowledge                 — 招聘知识/流程/法规类
-    5. chitchat                  — 闲聊/问候类
+    3. job_search                — 求职者搜索公开职位（原 job_match 求职侧）
+    4. job_manage                — 招聘者管理自己公司职位（新增）
+    5. candidate_search          — 招聘者查询候选人（原 job_match 招聘侧）
+    6. knowledge                 — 招聘知识/流程/法规类
+    7. chitchat                  — 闲聊/问候类
     返回 None 表示规则未命中，交由 LLM 处理。
 
-使用方式：
-    from rag_modules.rule_router import RuleRouter
-    router = RuleRouter()
-    intent = router.route("帮我解析这份简历")   # → "resume_parse" 或 None
+注意：规则层不感知 user_role，角色权限校验由控制器层统一处理。
 """
 
 import re
 import logging
 from typing import Optional
-from rag_modules.supervisor import Intent  # 复用已有类型定义
+from rag_modules.supervisor import Intent
 
 logger = logging.getLogger(__name__)
 
@@ -32,9 +27,8 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────
 
 def _normalize(text: str) -> str:
-    """统一全角→半角、去除多余空格，便于正则命中"""
+    """统一全角→半角、去除多余空格"""
     text = text.strip()
-    # 全角转半角（数字、字母）
     result = []
     for ch in text:
         code = ord(ch)
@@ -58,7 +52,7 @@ def _match_any_pattern(text: str, patterns: list[re.Pattern]) -> bool:
 
 
 # ─────────────────────────────────────────────
-# 规则数据集（按意图分组，便于维护扩展）
+# 规则数据集
 # ─────────────────────────────────────────────
 
 # 1. 否定保护关键词：含这些词时，意图模糊，交给 LLM
@@ -84,54 +78,70 @@ _RESUME_PATTERNS: list[re.Pattern] = [
     re.compile(r"(上传|发送|给你).{0,6}简历"),
 ]
 
-# ── job_match ─────────────────────────────────
-_MATCH_KEYWORDS: list[str] = [
-    "匹配候选人", "推荐候选人", "推荐职位", "找候选人", "找人才",
-    "筛选简历",   # 注意："筛选简历"归 job_match，纯"简历"归 resume_parse
-    "招聘需求", "岗位需求", "职位描述", "招募", "招人",
-    "合适的人", "符合条件", "人才库", "候选人推荐",
-    "寻找人才",
-    # 招聘动词 + 职位词组合（不单独用"jd"，避免误判知识类）
+# ── job_search（求职者搜索公开职位）──────────
+_JOB_SEARCH_KEYWORDS: list[str] = [
+    "找工作", "找职位", "找岗位", "求职", "应聘", "投简历",
+    "有没有职位", "推荐职位", "招聘信息", "在招",
     "招前端", "招后端", "招开发", "招运营", "招设计", "招产品", "招销售",
-    "我想招", "帮我招",
+    "我想找", "想应聘", "帮我找工作",
 ]
 
-_MATCH_PATTERNS: list[re.Pattern] = [
-    re.compile(r"招聘.{0,15}(推荐|匹配|找|筛选)"),
-    re.compile(r"(找|推荐|匹配).{0,10}(工程师|开发|产品经理|运营|设计师|销售|hr|测试|数据|算法|前端|后端|全栈)"),
-    # "这个JD匹配/找/推荐" — job_match
-    re.compile(r"(这个|该).{0,4}jd.{0,10}(匹配|找|推荐|适合)"),
+_JOB_SEARCH_PATTERNS: list[re.Pattern] = [
+    re.compile(
+        r"(找|推荐|有没有).{0,10}"
+        r"(工程师|开发|产品经理|运营|设计师|销售|测试|数据|算法|前端|后端|全栈)"
+        r".{0,6}(职位|岗位|工作)"
+    ),
+    re.compile(r"帮我找.{0,10}(工程师|开发|经理|专员|设计师|运营|销售|前端|后端|测试|算法)"),
+    re.compile(r"(想找|要找|想应聘).{0,15}(工作|职位|岗位)"),
+    re.compile(r"(深圳|上海|北京|广州|东莞|杭州|成都|武汉|西安|南京).{0,10}(职位|岗位|工作)"),
+    re.compile(r"(全职|兼职|实习|临时工).{0,6}(职位|岗位|工作|推荐)"),
+]
+
+# ── job_manage（招聘者管理自己公司职位）───────
+_JOB_MANAGE_KEYWORDS: list[str] = [
+    "我们公司", "公司职位", "公司岗位", "公司在招", "发布的职位",
+    "发布的岗位", "我发布", "我们发布", "公司有多少职位",
+    "查看职位", "管理职位", "职位列表",
+]
+
+_JOB_MANAGE_PATTERNS: list[re.Pattern] = [
+    re.compile(r"(我们|我|本)公司.{0,10}(职位|岗位|在招|发布)"),
+    re.compile(r"(查看|查询|看看).{0,6}(公司|我们).{0,6}(职位|岗位)"),
+    re.compile(r"公司.{0,6}(有多少|有哪些|在招).{0,6}(职位|岗位|工作)"),
+    re.compile(r"(发布|上线).{0,6}(职位|岗位).{0,6}(列表|情况|状态)"),
+]
+
+# ── candidate_search（招聘者查询候选人）───────
+_CANDIDATE_SEARCH_KEYWORDS: list[str] = [
+    "候选人", "报名情况", "报名人员", "应聘者", "找候选人",
+    "筛选简历", "匹配候选人", "推荐人才", "查报名", "有多少人报名",
+    "审核候选人", "录用", "不适合",
+]
+
+_CANDIDATE_SEARCH_PATTERNS: list[re.Pattern] = [
+    re.compile(r"(查看|查询|有多少).{0,10}(候选人|报名|应聘者)"),
+    re.compile(r"(筛选|过滤|审核).{0,6}(简历|候选人)"),
+    re.compile(r"(这个|该).{0,4}(职位|岗位|jd).{0,10}(候选人|报名|应聘)"),
     re.compile(r"(哪些|哪个).{0,6}(候选人|求职者).{0,6}(符合|适合|匹配)"),
-    re.compile(r"(按|根据).{0,10}(jd|职位|岗位).{0,6}(推荐|匹配|筛选)"),
-    # 帮我找/招 + 职位词（不含纯"帮我找"，太模糊）
-    re.compile(r"帮我(找|招|推荐).{0,10}(工程师|开发|经理|专员|设计师|运营|销售|前端|后端|测试|算法)"),
-    re.compile(r"(想招|要招|需要招).{0,15}(工程师|开发|经理|专员|设计师|运营|销售|前端|后端|测试)"),
-    # "筛选简历"是 job_match 场景，通过正则优先覆盖
-    re.compile(r"(筛选|过滤).{0,6}简历"),
-    # "JD 匹配简历"场景
-    re.compile(r"jd.{0,10}(匹配|找|对应|适合).{0,6}简历"),
-    re.compile(r"简历.{0,10}(匹配|符合|适合).{0,6}(jd|岗位|职位|需求)"),
+    re.compile(r"帮我(找|推荐|筛选).{0,10}(候选人|人才|简历)"),
 ]
 
 # ── knowledge ─────────────────────────────────
 _KNOWLEDGE_KEYWORDS: list[str] = [
-    # 操作动词（限招聘场景，不用"如何/怎么"裸词，避免误伤 chitchat）
     "注意事项", "技巧", "方法", "流程", "步骤",
-    # 招聘领域实体
     "试用期", "劳动合同", "劳动法", "薪酬", "薪资结构", "背调", "背景调查",
     "offer模板", "入职流程", "离职流程", "绩效考核", "kpi考核",
     "面试题", "面试官", "面试流程", "面试技巧",
     "招聘流程", "猎头", "人力资源", "hr知识",
     "什么是", "解释一下", "介绍一下",
-    "写jd", "撰写jd", "制作jd",   # 知识类"写JD"场景
+    "写jd", "撰写jd", "制作jd",
 ]
 
 _KNOWLEDGE_PATTERNS: list[re.Pattern] = [
-    # "如何/怎么 + 招聘场景动词" — 精确限定，不裸用"怎么"
     re.compile(r"(如何|怎么|怎样).{0,20}(面试|招聘|谈薪|入职|离职|背调|考核|写jd|制作jd)"),
     re.compile(r"(面试|招聘|试用期|劳动法|薪酬|offer).{0,15}(注意|技巧|要求|规定|标准|流程|步骤)"),
     re.compile(r"(什么是|介绍|解释).{0,15}(背调|猎头|offer|kpi|绩效|试用期|劳动合同)"),
-    # 写/撰写 JD 是知识类
     re.compile(r"(写|撰写|制作|怎么写).{0,6}(jd|职位描述|招聘要求|offer)"),
     re.compile(r"(offer|jd).{0,6}(怎么写|如何写|模板|范本|格式)"),
     re.compile(r"招聘.{0,10}(需要注意|流程|步骤|标准|规范)"),
@@ -145,51 +155,54 @@ _CHITCHAT_KEYWORDS: list[str] = [
     "谢谢", "感谢", "thanks", "thank you",
     "再见", "拜拜", "bye", "下次见",
     "你是谁", "你叫什么", "你是什么", "你能做什么", "你有什么功能",
-    # 非招聘话题（独立实体词，不依赖"怎么"）
     "天气", "股票", "新闻", "吃什么", "心情",
     "股价", "行情", "涨了", "跌了", "今日指数",
     "哈哈", "笑死", "有意思", "好玩",
 ]
 
 _CHITCHAT_PATTERNS: list[re.Pattern] = [
-    # 纯问候（短句锚定首尾）
     re.compile(r"^(你好|hello|hi|嗨|哈喽)[！!。.？?～~\s]*$", re.IGNORECASE),
     re.compile(r"^(早上好|下午好|晚上好|早安|晚安)[！!。.？?～~\s]*$"),
     re.compile(r"^(谢谢|感谢|thanks|thank\s*you)[！!。.，,\s]*$", re.IGNORECASE),
     re.compile(r"^(再见|拜拜|bye)[！!。.？?\s]*$", re.IGNORECASE),
-    # 关于 AI 身份的闲聊
     re.compile(r"你(是谁|叫什么名字|是什么模型|能做什么|有什么功能)[？?\s]*$"),
-    # 与招聘完全无关的话题 — 含"天气/股票/行情"的任意句子
     re.compile(r"(今天|明天|最近|现在|当前).{0,6}(天气|股票|行情|股价|指数|涨跌)"),
     re.compile(r"(天气|股票|股价|行情).{0,10}(怎么样|如何|好不好|涨了|跌了)"),
 ]
 
-# ── 高置信度短句映射（完全匹配，优先于关键词） ──
-# key: 精确短语  value: 意图
+# ── 精确短句映射（最高优先级）──────────────────
 _EXACT_MAP: dict[str, Intent] = {
     # resume_parse
-    "解析简历": "resume_parse",
-    "分析简历": "resume_parse",
-    "看简历": "resume_parse",
+    "解析简历":     "resume_parse",
+    "分析简历":     "resume_parse",
+    "看简历":       "resume_parse",
     "提取简历信息": "resume_parse",
-    "简历分析": "resume_parse",
-    "简历解析": "resume_parse",
-    # job_match
-    "匹配候选人": "job_match",
-    "推荐岗位": "job_match",
-    "推荐人才": "job_match",
-    "找候选人": "job_match",
-    "筛选简历": "job_match",
-    "招聘匹配": "job_match",
+    "简历分析":     "resume_parse",
+    "简历解析":     "resume_parse",
+    # job_search
+    "找工作":       "job_search",
+    "找职位":       "job_search",
+    "推荐岗位":     "job_search",
+    # job_manage
+    "公司职位":     "job_manage",
+    "我们公司职位": "job_manage",
+    "查看职位":     "job_manage",
+    "职位列表":     "job_manage",
+    # candidate_search
+    "匹配候选人":   "candidate_search",
+    "推荐人才":     "candidate_search",
+    "找候选人":     "candidate_search",
+    "筛选简历":     "candidate_search",
+    "招聘匹配":     "candidate_search",
     # chitchat
-    "你好": "chitchat",
-    "hi": "chitchat",
-    "hello": "chitchat",
-    "嗨": "chitchat",
-    "谢谢": "chitchat",
-    "感谢": "chitchat",
-    "再见": "chitchat",
-    "拜拜": "chitchat",
+    "你好":   "chitchat",
+    "hi":     "chitchat",
+    "hello":  "chitchat",
+    "嗨":     "chitchat",
+    "谢谢":   "chitchat",
+    "感谢":   "chitchat",
+    "再见":   "chitchat",
+    "拜拜":   "chitchat",
 }
 
 
@@ -200,7 +213,7 @@ _EXACT_MAP: dict[str, Intent] = {
 class RuleRouter:
     """
     基于关键词 + 正则的轻量规则路由器。
-
+    不感知 user_role，角色权限校验统一由控制器层处理。
     命中时：直接返回 Intent（跳过 LLM）。
     未命中时：返回 None，由 Supervisor 继续 LLM 流程。
 
@@ -217,25 +230,21 @@ class RuleRouter:
                 关键词和正则各贡献 1 分，可调高阈值提升精确率。
         """
         self.confidence_threshold = confidence_threshold
-        logger.info(
-            f"RuleRouter 初始化完成，置信度阈值={confidence_threshold}"
-        )
-
+        logger.info(f"RuleRouter 初始化完成，置信度阈值={confidence_threshold}")
     # ── 公开接口 ──────────────────────────────
 
     def route(self, query: str) -> Optional[Intent]:
         """
         尝试对 query 进行规则路由。
-
         Args:
-            query: 原始用户输入（route 内部会自动归一化）
+            query: 原始用户输入
 
         Returns:
             命中的 Intent 字符串，或 None（交由 LLM 处理）
         """
         text = _normalize(query).lower()
 
-        # 0. 精确短句映射（最高优先级，零歧义）
+        # 0. 精确短句映射
         intent = self._exact_match(text)
         if intent:
             logger.info(f"[规则路由] 精确命中 '{query}' → {intent}")
@@ -246,25 +255,24 @@ class RuleRouter:
             logger.debug(f"[规则路由] 含否定词，放行给 LLM: '{query}'")
             return None
 
-        # 2. 冲突裁决：job_match 正则命中时，直接优先于关键词积分（防止"简历"词干扰）
-        if _match_any_pattern(text, _MATCH_PATTERNS):
-            # 排除 chitchat（极低可能同时命中，保险起见检查一下）
+        # 2. candidate_search 正则优先（防止"筛选简历"被 resume_parse 关键词抢走）
+        if _match_any_pattern(text, _CANDIDATE_SEARCH_PATTERNS):
             if not _match_any_pattern(text, _CHITCHAT_PATTERNS):
-                logger.info(f"[规则路由] job_match 正则优先命中 '{query}' → job_match")
-                return "job_match"
+                logger.info(f"[规则路由] candidate_search 正则优先命中 '{query}'")
+                return "candidate_search"
 
-        # 3. 按意图顺序打分，返回首个得分达标的意图
+        # 3. 按意图顺序打分
         for intent_label, kw_list, pat_list in [
-            ("resume_parse", _RESUME_KEYWORDS, _RESUME_PATTERNS),
-            ("job_match",    _MATCH_KEYWORDS,  _MATCH_PATTERNS),
-            ("knowledge",    _KNOWLEDGE_KEYWORDS, _KNOWLEDGE_PATTERNS),
-            ("chitchat",     _CHITCHAT_KEYWORDS,  _CHITCHAT_PATTERNS),
+            ("resume_parse",     _RESUME_KEYWORDS,           _RESUME_PATTERNS),
+            ("job_search",       _JOB_SEARCH_KEYWORDS,       _JOB_SEARCH_PATTERNS),
+            ("job_manage",       _JOB_MANAGE_KEYWORDS,       _JOB_MANAGE_PATTERNS),
+            ("candidate_search", _CANDIDATE_SEARCH_KEYWORDS, _CANDIDATE_SEARCH_PATTERNS),
+            ("knowledge",        _KNOWLEDGE_KEYWORDS,        _KNOWLEDGE_PATTERNS),
+            ("chitchat",         _CHITCHAT_KEYWORDS,         _CHITCHAT_PATTERNS),
         ]:
             score = self._score(text, kw_list, pat_list)
             if score >= self.confidence_threshold:
-                logger.info(
-                    f"[规则路由] 命中 '{query}' → {intent_label} (score={score})"
-                )
+                logger.info(f"[规则路由] 命中 '{query}' → {intent_label} (score={score})")
                 return intent_label  # type: ignore
 
         logger.debug(f"[规则路由] 未命中，交由 LLM: '{query}'")
@@ -290,10 +298,12 @@ class RuleRouter:
         has_negation = _any_keyword(text, _NEGATION_WORDS)
         scores = {}
         for label, kw_list, pat_list in [
-            ("resume_parse", _RESUME_KEYWORDS, _RESUME_PATTERNS),
-            ("job_match",    _MATCH_KEYWORDS,  _MATCH_PATTERNS),
-            ("knowledge",    _KNOWLEDGE_KEYWORDS, _KNOWLEDGE_PATTERNS),
-            ("chitchat",     _CHITCHAT_KEYWORDS,  _CHITCHAT_PATTERNS),
+            ("resume_parse",     _RESUME_KEYWORDS,           _RESUME_PATTERNS),
+            ("job_search",       _JOB_SEARCH_KEYWORDS,       _JOB_SEARCH_PATTERNS),
+            ("job_manage",       _JOB_MANAGE_KEYWORDS,       _JOB_MANAGE_PATTERNS),
+            ("candidate_search", _CANDIDATE_SEARCH_KEYWORDS, _CANDIDATE_SEARCH_PATTERNS),
+            ("knowledge",        _KNOWLEDGE_KEYWORDS,        _KNOWLEDGE_PATTERNS),
+            ("chitchat",         _CHITCHAT_KEYWORDS,         _CHITCHAT_PATTERNS),
         ]:
             scores[label] = self._score(text, kw_list, pat_list)
 
@@ -319,6 +329,6 @@ class RuleRouter:
         计算文本对某个意图的匹配得分：
             关键词命中一个 +1，正则命中一个 +1（上限各 3，防止关键词堆叠失真）
         """
-        kw_score = min(sum(1 for kw in keywords if kw in text), 3)
+        kw_score  = min(sum(1 for kw in keywords if kw in text), 3)
         pat_score = min(sum(1 for p in patterns if p.search(text)), 3)
         return kw_score + pat_score

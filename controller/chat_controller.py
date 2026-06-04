@@ -7,15 +7,22 @@ chat_controller.py — 对话控制器
     3. 历史管理委托给 session_manager，通过 _get_history / _append_history 读写
     4. 提供 process_message（文本对话）和 process_file（文件上传）两个入口
     5. 将 Agent 返回的统一响应字典透传给 View 层
+
+权限控制三道防线：
+    第一道：LLM 路由层（supervisor.py）— 感知角色，减少越权意图生成概率
+    第二道：控制器层（本文件）— 白名单硬校验，意图不在白名单直接返回 permission_denied
+    第三道：Agent 层 — job_manage/candidate_search 的 SQL 强制携带 company_id
 """
 
 import logging
-from collections import deque
+from typing import Optional
 
 from rag_modules.supervisor import Supervisor
 from rag_modules.agents import (
     resume_agent,
-    match_agent,
+    job_search_agent,
+    job_manage_agent,
+    candidate_search_agent,
     knowledge_agent,
     chitchat_agent,
     unknown_agent,
@@ -25,6 +32,40 @@ from controller import session_manager
 logger = logging.getLogger(__name__)
 
 
+# ─────────────────────────────────────────────
+# 权限控制常量
+# ─────────────────────────────────────────────
+
+_ROLE_INTENT_WHITELIST: dict[str, set[str]] = {
+    "jobseeker": {
+        "resume_parse", "job_search", "knowledge", "chitchat", "unknown",
+    },
+    "recruiter": {
+        "resume_parse", "job_manage", "candidate_search", "knowledge", "chitchat", "unknown",
+    },
+}
+
+_PERMISSION_DENIED_MESSAGES: dict = {
+    # 求职者触发了招聘者功能
+    ("jobseeker", "candidate_search"): (
+        "抱歉，候选人查询功能仅限招聘者使用。"
+        "如需搜索职位，可以告诉我您的求职需求，例如城市、岗位或薪资要求 😊"
+    ),
+    ("jobseeker", "job_manage"): (
+        "抱歉，职位管理功能仅限招聘者使用。"
+        "如需查找工作，可以直接告诉我您想找什么类型的职位。"
+    ),
+    # 招聘者触发了求职者功能
+    ("recruiter", "job_search"): (
+        "抱歉，您当前以招聘者身份登录，平台求职功能不对招聘者开放。"
+        "如需查看公司职位，请说'查看我们公司的职位'；"
+        "如需查看候选人，请告诉我职位名称。"
+    ),
+    # 通用兜底
+    "default": "抱歉，您当前身份无权使用该功能，请确认操作是否正确。",
+}
+
+
 class ChatController:
     """
     对话控制器 - 协调 Supervisor 路由与各 Agent 执行。
@@ -32,12 +73,14 @@ class ChatController:
     路由流程（两级漏斗）：
         用户输入
             ↓
-        [Level-1] 规则路由 (RuleRouter)
-            命中 ──→ 直接调用 Agent（0 次 LLM）
+        [Level-1] 规则路由 (RuleRouter)  — 不感知角色
+            命中 ──→ 控制器权限校验
             ↓ 未命中
-        [Level-2] LLM 路由 (query_rewrite → query_router)
+        [Level-2] LLM 路由 (query_router) — 感知角色
             ↓
-        调用对应 Agent，返回统一响应字典
+        [控制器] 白名单权限校验
+            通过 → 调用 Agent
+            拒绝 → 返回 permission_denied
     """
 
     def __init__(
@@ -65,11 +108,13 @@ class ChatController:
         )
 
         self._agent_map = {
-            "resume_parse": self._call_resume,
-            "job_match":    self._call_match,
-            "knowledge":    self._call_knowledge,
-            "chitchat":     self._call_chitchat,
-            "unknown":      self._call_unknown,
+            "resume_parse":     self._call_resume,
+            "job_search":       self._call_job_search,
+            "job_manage":       self._call_job_manage,
+            "candidate_search": self._call_candidate_search,
+            "knowledge":        self._call_knowledge,
+            "chitchat":         self._call_chitchat,
+            "unknown":          self._call_unknown,
         }
 
     # ==================== 历史读写 ====================
@@ -90,7 +135,7 @@ class ChatController:
     def process_message(self, user_input: str) -> dict:
         """
         处理纯文本对话，返回统一响应字典。
-
+        包含完整的两级路由 + 权限校验流程。
         Args:
             user_input: 用户原始输入
 
@@ -98,9 +143,29 @@ class ChatController:
             {"intent": "...", "data": {"message": "..."}, "status": "success"/"error"}
         """
         try:
-            processed_query, intent = self.supervisor.route(user_input)
+            # 路由：规则层（不感知角色）→ LLM 层（感知角色）
+            processed_query, intent = self.supervisor.route(user_input, self.user_role)
+
+            # 权限校验（第二道防线）
+            allowed = _ROLE_INTENT_WHITELIST.get(self.user_role, set())
+            if intent not in allowed:
+                msg = (
+                    _PERMISSION_DENIED_MESSAGES.get((self.user_role, intent))
+                    or _PERMISSION_DENIED_MESSAGES["default"]
+                )
+                logger.warning(
+                    f"[权限拦截] user_role={self.user_role} intent={intent} "
+                    f"query='{user_input}'"
+                )
+                return {
+                    "intent": "permission_denied",
+                    "data":   {"message": msg},
+                    "status": "error",
+                }
+
             handler  = self._agent_map.get(intent, self._call_unknown)
             response = handler(processed_query)
+
         except Exception as e:
             logger.error(f"处理消息时出错: {e}")
             response = {
@@ -113,6 +178,7 @@ class ChatController:
     def process_file(self, file_path: str) -> dict:
         """
         处理文件上传（简历解析），直接调用 resume_agent，跳过路由。
+        两种角色均可使用。
         resume_agent 每次独立分析，不读写历史。
 
         Args:
@@ -153,6 +219,27 @@ class ChatController:
             session_manager.clear_session(self.session_id)
         logger.info(f"历史已清空: session={self.session_id} agent={agent_type or 'all'}")
 
+    # ==================== company_id 获取（招聘者专用）====================
+
+    def _get_company_id(self) -> Optional[int]:
+        """
+        根据 user_id 查询招聘者关联的 company_id。
+        结果缓存在实例变量中，同一请求只查一次数据库。
+        查不到时返回 None，调用方负责返回错误提示。
+        """
+        if hasattr(self, "_cached_company_id"):
+            return self._cached_company_id
+
+        from db.mysql_client import MySQLClient
+        db = MySQLClient()
+        company = db.get_company_by_user_id(self.user_id)
+        self._cached_company_id = company.id if company else None
+
+        if self._cached_company_id is None:
+            logger.warning(f"[权限] user_id={self.user_id} 未关联已审核企业")
+
+        return self._cached_company_id
+
     # ==================== 各 Agent 调用封装 ====================
 
     def _call_chitchat(self, query: str) -> dict:
@@ -179,28 +266,11 @@ class ChatController:
         self._append_history("knowledge", query, response["data"]["message"])
         return response
 
-    def _call_match(self, query: str) -> dict:
-        """
-        调用 match_agent，传入历史和 llm。
-        存历史时只存 message 摘要，不存 jobs/candidates 列表。
-        """
-        history  = self._get_history("match")
-        response = match_agent.handle(
-            query     = query,
-            user_role = self.user_role,
-            history   = history,
-            llm       = self.supervisor.llm,
-        )
-        # 只取 message 字段存历史，不存 jobs/candidates
-        self._append_history("match", query, response["data"]["message"])
-        return response
-
     def _call_resume(self, query: str) -> dict:
         """
         文本路由命中 resume_parse 时的入口。
         CLI 场景：_pending_file_path 有值时直接解析文件。
-        Web 场景：_pending_file_path 为 None，返回引导提示，
-                  实际文件解析由前端上传后调用 process_file() 处理。
+        Web 场景：返回引导提示，实际文件解析由前端调用 process_file() 处理。
         """
         if self._pending_file_path:
             file_path = self._pending_file_path.replace('\\', '/')
@@ -210,6 +280,55 @@ class ChatController:
             "data":   {"message": "请上传您的简历文件（支持 .pdf 和 .docx 格式），我来为您解析。"},
             "status": "success",
         }
+
+    def _call_job_search(self, query: str) -> dict:
+        """求职者职位搜索，无需 company_id。"""
+        history  = self._get_history("job_search")
+        response = job_search_agent.handle(
+            query   = query,
+            history = history,
+            llm     = self.supervisor.llm,
+        )
+        self._append_history("job_search", query, response["data"]["message"])
+        return response
+
+    def _call_job_manage(self, query: str) -> dict:
+        """招聘者查看自己公司职位，强制注入 company_id。"""
+        company_id = self._get_company_id()
+        if company_id is None:
+            return {
+                "intent": "job_manage",
+                "data":   {"message": "您的账号暂未关联企业信息，请联系管理员完成企业认证后再试。"},
+                "status": "error",
+            }
+        history  = self._get_history("job_manage")
+        response = job_manage_agent.handle(
+            query      = query,
+            company_id = company_id,
+            history    = history,
+            llm        = self.supervisor.llm,
+        )
+        self._append_history("job_manage", query, response["data"]["message"])
+        return response
+
+    def _call_candidate_search(self, query: str) -> dict:
+        """招聘者查候选人，强制注入 company_id。"""
+        company_id = self._get_company_id()
+        if company_id is None:
+            return {
+                "intent": "candidate_search",
+                "data":   {"message": "您的账号暂未关联企业信息，请联系管理员完成企业认证后再试。"},
+                "status": "error",
+            }
+        history  = self._get_history("candidate_search")
+        response = candidate_search_agent.handle(
+            query      = query,
+            company_id = company_id,
+            history    = history,
+            llm        = self.supervisor.llm,
+        )
+        self._append_history("candidate_search", query, response["data"]["message"])
+        return response
 
     def _call_unknown(self, query: str) -> dict:
         return unknown_agent.handle(

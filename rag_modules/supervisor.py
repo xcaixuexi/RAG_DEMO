@@ -10,8 +10,16 @@ from langchain_core.output_parsers import StrOutputParser
 
 logger = logging.getLogger(__name__)
 
-# 定义意图类型
-Intent = Literal["resume_parse", "job_match", "knowledge", "chitchat", "unknown"]
+# 定义意图类型（拆分原 job_match 为三个独立意图）
+Intent = Literal[
+    "resume_parse",
+    "job_search",       # 求职者搜索平台公开职位
+    "job_manage",       # 招聘者查看/管理自己公司职位
+    "candidate_search", # 招聘者查询候选人和报名情况
+    "knowledge",
+    "chitchat",
+    "unknown",
+]
 
 
 class Supervisor:
@@ -20,7 +28,7 @@ class Supervisor:
 
     路由策略（两级漏斗）：
         Level-1  RuleRouter（规则层）  — 关键词 + 正则，零 LLM 调用，毫秒级
-        Level-2  LLM Router（模型层） — query_rewrite → query_router，处理模糊输入
+        Level-2  LLM Router（模型层） — query_router，处理模糊输入
 
     命中率统计：
         通过 get_stats() 可查看两级各自的命中次数，用于后期规则调优。
@@ -42,12 +50,12 @@ class Supervisor:
         """
         Args:
             model_name: 模型名称，默认 glm-4.5-air
-                        切换 GPT 时传入 "gpt-4o-mini" 并将 base_url 留空或改为官方地址
+                        切换 GPT 时传入 "deepseek-v4-flash" 并将 base_url 留空或改为官方地址
             temperature: 生成温度，控制输出随机性
             top_p: 核采样参数
             max_tokens: 最大输出 Token 数
             api_key: API Key（可选，默认读取环境变量 ZHIPU_API_KEY 或 OPENAI_API_KEY）
-            base_url: API 基础 URL；切换到 OpenAI 官方时传 "https://api.openai.com/v1/" 即可
+            base_url: API 基础 URL；切换到 OpenAI 官方时传 "https://api.deepseek.com" 即可
             rule_confidence_threshold: 规则路由置信度阈值（≥1 即命中）
             enable_rule_router: 是否启用规则路由层（False 可退回纯 LLM 路由，便于 A/B 对比）
         """
@@ -70,7 +78,6 @@ class Supervisor:
             self._rule_router = None
 
     def _setup_llm(self, api_key: Optional[str], base_url: str) -> ChatOpenAI:
-        """初始化 ChatOpenAI，支持智谱 / OpenAI 官方 / 其他兼容接口"""
         logger.info(f"正在初始化路由主管 LLM: {self.model_name}, base_url: {base_url}")
 
         key = api_key
@@ -95,21 +102,22 @@ class Supervisor:
 
     # ==================== 对外主接口 ====================
 
-    def route(self, query: str) -> tuple[str, Intent]:
+    def route(self, query: str, user_role: str = "jobseeker") -> tuple[str, Intent]:
         """
         两级路由主入口，供 ChatController 调用。
 
         Args:
-            query: 用户原始输入
+            query:     用户原始输入
+            user_role: 用户角色，传给 LLM 路由层提供上下文
 
         Returns:
             (processed_query, intent)
-            - processed_query: 规则路由时为原 query；LLM 路由时为重写后的 query
+            - processed_query: 规则路由时为原 query
             - intent: 最终意图标签
         """
         self.stats["total"] += 1
 
-        # ── Level-1：规则路由 ──────────────────────────
+        # ── Level-1：规则路由（不感知角色，只做文本特征匹配）──
         if self._rule_router:
             intent = self._rule_router.route(query)
             if intent is not None:
@@ -120,10 +128,10 @@ class Supervisor:
                 )
                 return query, intent
 
-        # ── Level-2：LLM 路由 ─────────────────────────
-        # rewritten = self.query_rewrite(query)
-        # intent = self.query_router(rewritten)
-        intent = self.query_router(query)
+        # ── Level-2：LLM 路由（感知角色）──
+        # rewritten = self.query_rewrite(query)  # 可选的查询重写，暂时不启用，保持原 query 直接路由
+        # intent = self.query_router(rewritten, user_role)
+        intent = self.query_router(query, user_role)
         self.stats["llm_hit"] += 1
         logger.info(
             # f"[LLM路由命中] '{query}' → rewrite='{rewritten}' → {intent} "
@@ -205,51 +213,67 @@ class Supervisor:
 
         return response
 
-    # ==================== 2. 查询路由（意图识别） ====================
+    # ==================== 查询路由（意图识别） ====================
 
-    def query_router(self, query: str) -> Intent:
+    def query_router(self, query: str, user_role: str = "jobseeker") -> Intent:
         """
-        查询路由 - 根据用户问题分类到预定义意图
+        LLM 路由，感知用户角色。即便角色不匹配也如实输出意图，
+        不在 Prompt 层做拦截（拦截逻辑集中在控制器层）。
 
         Args:
-            query: 用户查询
+            query:     用户查询
+            user_role: 当前用户角色
 
         Returns:
-            意图标签 (resume_parse, job_match, knowledge, chitchat, unknown)
+            意图标签
         """
         prompt = ChatPromptTemplate.from_template("""
-你是一个招聘AI助手的路由分类器。根据用户的问题，将其分类为以下意图之一，**只输出标签，不要输出任何其他文字**：
+你是一个招聘AI助手的路由分类器。根据用户的问题，将其分类为以下意图之一。
 
-- **resume_parse** : 用户要求解析简历内容、提取信息（工作经历、技能、教育背景）、分析简历优劣
-  示例："帮我分析这份简历"、"提取简历中的技能"、"这份简历适合什么岗位"
+当前用户角色：{user_role}
 
-- **job_match** : 用户要求根据岗位描述匹配岗位，查询符合条件的职位列表，或者询问岗位相关的统计信息
-  示例："目前临时工岗位有多少"、"深圳地区的职位推荐"、"帮我看看度才子公司有多少岗位在招人"
+意图说明：
+- **resume_parse**：解析或分析简历内容（两种角色均可触发）
+  示例："帮我分析这份简历"、"提取工作经历"、"简历评分"
 
-- **knowledge** : 用户询问招聘流程、面试技巧、劳动法规、薪酬标准、行业知识等
+- **job_search**：求职者在平台上搜索公开职位（通常由 jobseeker 触发）
+  示例："深圳有哪些Python职位"、"我想找实习"、"推荐前端职位"、"有没有临时工岗位"
+
+- **job_manage**：招聘者查看或管理自己公司发布的职位（通常由 recruiter 触发）
+  示例："我们公司有哪些在招职位"、"查一下公司发布的岗位"、"公司有多少职位"
+
+- **candidate_search**：招聘者查询候选人和报名情况（通常由 recruiter 触发）
+  示例："产品经理职位有多少人报名"、"帮我筛选候选人"、"查看报名记录"
+
+- **knowledge**：招聘流程、面试技巧、劳动法规、薪酬知识等问答（两种角色均可触发）
   示例："面试时要注意什么"、"如何写招聘JD"、"试用期法律要求"
 
-- **chitchat** : 用户进行日常问候、闲聊、与工作无关的对话
-  示例："你好呀"、"今天天气怎么样"、"你叫什么名字"、"今天股票行情"
+- **chitchat**：日常问候闲聊（两种角色均可触发）
+  示例："你好呀"、"今天天气怎么样"、"你叫什么名字"
 
-- **unknown** : 无法明确归类的其他问题，或者不属于以上任何一类
+- **unknown**：无法明确归类的其他问题
+
+重要规则：
+如果识别到的意图与当前用户角色不匹配（例如 jobseeker 触发了 job_manage 或
+candidate_search，或 recruiter 触发了 job_search），仍然输出该意图标签，
+不要自行修正为其他意图。角色权限校验由上层控制器处理。
+
+**只输出意图标签，不输出任何其他文字。**
 
 用户问题: {query}
 
 分类结果（仅标签）:""")
 
-        chain = (
-            {"query": RunnablePassthrough()}
-            | prompt
-            | self.llm
-            | StrOutputParser()
-        )
+        chain = prompt | self.llm | StrOutputParser()
 
-        result = chain.invoke(query).strip().lower()
+        result = chain.invoke({"query": query, "user_role": user_role}).strip().lower()
 
-        valid_intents = ["resume_parse", "job_match", "knowledge", "chitchat"]
+        valid_intents = [
+            "resume_parse", "job_search", "job_manage",
+            "candidate_search", "knowledge", "chitchat",
+        ]
         if result in valid_intents:
-            logger.info(f"路由决策: '{query}' → {result}")
+            logger.info(f"路由决策: '{query}' (role={user_role}) → {result}")
             return result  # type: ignore
         else:
             logger.warning(f"未知路由结果 '{result}'，降级为 unknown")
