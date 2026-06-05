@@ -114,17 +114,27 @@ _JOB_MANAGE_PATTERNS: list[re.Pattern] = [
 
 # ── candidate_search（招聘者查询候选人）───────
 _CANDIDATE_SEARCH_KEYWORDS: list[str] = [
+    # 查询已有数据类
     "候选人", "报名情况", "报名人员", "应聘者", "找候选人",
     "筛选简历", "匹配候选人", "推荐人才", "查报名", "有多少人报名",
     "审核候选人", "录用", "不适合",
+    # 描述招聘需求类
+    "帮我招", "我想招", "招募", "招一个", "招聘一个",
+    "需要招", "急招", "招人", "找人才",
 ]
 
 _CANDIDATE_SEARCH_PATTERNS: list[re.Pattern] = [
+    # 查询已有数据类
     re.compile(r"(查看|查询|有多少).{0,10}(候选人|报名|应聘者)"),
     re.compile(r"(筛选|过滤|审核).{0,6}(简历|候选人)"),
     re.compile(r"(这个|该).{0,4}(职位|岗位|jd).{0,10}(候选人|报名|应聘)"),
     re.compile(r"(哪些|哪个).{0,6}(候选人|求职者).{0,6}(符合|适合|匹配)"),
     re.compile(r"帮我(找|推荐|筛选).{0,10}(候选人|人才|简历)"),
+    # 描述招聘需求类
+    re.compile(r"(帮我|想|需要|急).{0,4}招.{0,15}(工程师|经理|专员|设计师|运营|销售|开发|测试|产品|前端|后端|算法|数据)"),
+    re.compile(r"招(聘|募).{0,4}(一个|一名|若干).{0,20}(经验|学历|要求|岗位|职位)"),
+    re.compile(r"(找|寻).{0,4}(一个|一名).{0,20}(工程师|经理|专员|设计师|运营|销售|开发|测试|产品)"),
+    re.compile(r"(岗位|职位).{0,10}(要求|条件|经验|学历).{0,10}(推荐|匹配|有没有)"),
 ]
 
 # ── knowledge ─────────────────────────────────
@@ -231,7 +241,7 @@ class RuleRouter:
         """
         self.confidence_threshold = confidence_threshold
         logger.info(f"RuleRouter 初始化完成，置信度阈值={confidence_threshold}")
-    # ── 公开接口 ──────────────────────────────
+        # ── 公开接口 ──────────────────────────────
 
     def route(self, query: str) -> Optional[Intent]:
         """
@@ -264,9 +274,9 @@ class RuleRouter:
         # 3. 按意图顺序打分
         for intent_label, kw_list, pat_list in [
             ("resume_parse",     _RESUME_KEYWORDS,           _RESUME_PATTERNS),
+            ("candidate_search", _CANDIDATE_SEARCH_KEYWORDS, _CANDIDATE_SEARCH_PATTERNS),  # 提前，避免"招人"类被 job_search 抢走
             ("job_search",       _JOB_SEARCH_KEYWORDS,       _JOB_SEARCH_PATTERNS),
             ("job_manage",       _JOB_MANAGE_KEYWORDS,       _JOB_MANAGE_PATTERNS),
-            ("candidate_search", _CANDIDATE_SEARCH_KEYWORDS, _CANDIDATE_SEARCH_PATTERNS),
             ("knowledge",        _KNOWLEDGE_KEYWORDS,        _KNOWLEDGE_PATTERNS),
             ("chitchat",         _CHITCHAT_KEYWORDS,         _CHITCHAT_PATTERNS),
         ]:
@@ -279,29 +289,15 @@ class RuleRouter:
         return None
 
     def explain(self, query: str) -> dict:
-        """
-        调试用：返回各意图的得分明细，帮助调整关键词/正则。
-
-        Returns:
-            {
-                "normalized": "...",
-                "negation_guard": True/False,
-                "scores": {
-                    "resume_parse": 2,
-                    "job_match": 0,
-                    ...
-                },
-                "result": "resume_parse" | None
-            }
-        """
+        """调试用：返回各意图的得分明细"""
         text = _normalize(query).lower()
         has_negation = _any_keyword(text, _NEGATION_WORDS)
         scores = {}
         for label, kw_list, pat_list in [
             ("resume_parse",     _RESUME_KEYWORDS,           _RESUME_PATTERNS),
+            ("candidate_search", _CANDIDATE_SEARCH_KEYWORDS, _CANDIDATE_SEARCH_PATTERNS),
             ("job_search",       _JOB_SEARCH_KEYWORDS,       _JOB_SEARCH_PATTERNS),
             ("job_manage",       _JOB_MANAGE_KEYWORDS,       _JOB_MANAGE_PATTERNS),
-            ("candidate_search", _CANDIDATE_SEARCH_KEYWORDS, _CANDIDATE_SEARCH_PATTERNS),
             ("knowledge",        _KNOWLEDGE_KEYWORDS,        _KNOWLEDGE_PATTERNS),
             ("chitchat",         _CHITCHAT_KEYWORDS,         _CHITCHAT_PATTERNS),
         ]:
