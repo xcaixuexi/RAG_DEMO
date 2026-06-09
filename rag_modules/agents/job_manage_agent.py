@@ -1,5 +1,5 @@
 """
-job_manage_agent.py — 招聘者职位管理 Agent
+job_manage_agent.py — 招聘者职位管理 Agent（Few-Shot 版）
 
 职责：帮助招聘者查看/管理自己公司发布的职位。
 仅服务招聘者（recruiter），且 SQL 强制注入 company_id 过滤，
@@ -15,10 +15,12 @@ API 响应格式：
         },
         "status": "success"
     }
+改进：SQL 生成 Prompt 增加 3 个 Few-Shot 示例。
 """
 
 import json
 import logging
+import re
 from string import Template
 from typing import Optional
 
@@ -32,10 +34,7 @@ logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────
-# Prompt（动态注入 company_id）
-#
-# 使用 string.Template（$company_id）而非 str.format()，
-# 避免 prompt 中 JSON 示例的花括号 {} 与 .format() 占位符冲突。
+# Prompt（动态注入 company_id + Few-Shot）
 # ─────────────────────────────────────────────
 
 _SQL_SYSTEM_TEMPLATE = Template("""你是一个招聘数据库查询助手，正在帮助招聘者查看自己公司发布的职位。
@@ -54,26 +53,61 @@ _SQL_SYSTEM_TEMPLATE = Template("""你是一个招聘数据库查询助手，正
     deploy_time  DATETIME 发布时间
 
 重要限制（数据隔离）：
-    所有查询必须加上 company_id = $company_id 条件，
-    绝对不允许生成不含 company_id 过滤的 SQL，这是数据安全要求。
+    所有查询必须加上 company_id = $company_id 条件。
 
 固定规则：
-    1. WHERE 条件必须包含 company_id = $company_id AND is_delete = 0
+    1. WHERE 必须包含 company_id = $company_id AND is_delete = 0
     2. 查询"在招/发布中"的职位时加 status=1 AND audit_status=1
     3. 用户未指定状态时默认查询全部未删除职位（不加 status 过滤）
-    4. list_sql 必须加 LIMIT 50 和 ORDER BY deploy_time DESC
+    4. list_sql 加 LIMIT 50 和 ORDER BY deploy_time DESC
     5. list_sql SELECT 字段固定为：
        id, name, company_name, company_logo, salary, salary_min, salary_max,
        job_exp, education, job_type, job_duty, work_city,
        contact_name, contact_phone, welfare, status, audit_status
     6. count_sql 固定为：SELECT COUNT(*) AS total FROM job WHERE ...
 
-只输出 JSON，格式：
+只输出 JSON，格式：{"count_sql": "...", "list_sql": "...", "message": "..."}
+
+═══════════════════════════════════════════════
+Few-Shot 示例（company_id 均用 $company_id）
+═══════════════════════════════════════════════
+
+【示例1 — 查询在招职位】
+用户输入: 我们公司现在有哪些在招职位
+输出:
 {
-    "count_sql": "SELECT COUNT(*) AS total FROM job WHERE company_id=$company_id AND ...",
-    "list_sql": "SELECT id, name, ... FROM job WHERE company_id=$company_id AND ... LIMIT 50",
-    "message": "一句话说明查询意图"
-}""")
+    "count_sql": "SELECT COUNT(*) AS total FROM job WHERE company_id = $company_id AND is_delete = 0 AND status = 1 AND audit_status = 1",
+    "list_sql": "SELECT id, name, company_name, company_logo, salary, salary_min, salary_max, job_exp, education, job_type, job_duty, work_city, contact_name, contact_phone, welfare, status, audit_status FROM job WHERE company_id = $company_id AND is_delete = 0 AND status = 1 AND audit_status = 1 ORDER BY deploy_time DESC LIMIT 50",
+    "message": "查询公司当前在招职位"
+}
+
+【示例2 — 多条件：职位类型 + 城市】
+用户输入: 公司在深圳发布的全职职位
+输出:
+{
+    "count_sql": "SELECT COUNT(*) AS total FROM job WHERE company_id = $company_id AND is_delete = 0 AND work_city LIKE '%深圳%' AND job_type = 0",
+    "list_sql": "SELECT id, name, company_name, company_logo, salary, salary_min, salary_max, job_exp, education, job_type, job_duty, work_city, contact_name, contact_phone, welfare, status, audit_status FROM job WHERE company_id = $company_id AND is_delete = 0 AND work_city LIKE '%深圳%' AND job_type = 0 ORDER BY deploy_time DESC LIMIT 50",
+    "message": "查询公司在深圳发布的全职职位"
+}
+
+【示例3 — 查询全部职位（不限状态）】
+用户输入: 公司所有职位列表
+输出:
+{
+    "count_sql": "SELECT COUNT(*) AS total FROM job WHERE company_id = $company_id AND is_delete = 0",
+    "list_sql": "SELECT id, name, company_name, company_logo, salary, salary_min, salary_max, job_exp, education, job_type, job_duty, work_city, contact_name, contact_phone, welfare, status, audit_status FROM job WHERE company_id = $company_id AND is_delete = 0 ORDER BY deploy_time DESC LIMIT 50",
+    "message": "查询公司全部职位"
+}
+
+【示例4 — 查询停止发布的职位】
+用户输入: 查一下已下线的职位
+输出:
+{
+    "count_sql": "SELECT COUNT(*) AS total FROM job WHERE company_id = $company_id AND is_delete = 0 AND status = 3",
+    "list_sql": "SELECT id, name, company_name, company_logo, salary, salary_min, salary_max, job_exp, education, job_type, job_duty, work_city, contact_name, contact_phone, welfare, status, audit_status FROM job WHERE company_id = $company_id AND is_delete = 0 AND status = 3 ORDER BY deploy_time DESC LIMIT 50",
+    "message": "查询公司已停止发布的职位"
+}
+═══════════════════════════════════════════════""")
 
 
 # ─────────────────────────────────────────────
@@ -86,7 +120,7 @@ def _llm_call(llm: ChatOpenAI, system: str, user_content: str,
     直接用 Message 对象构造消息列表，不经过 ChatPromptTemplate。
     避免 system prompt 中的 JSON 花括号被 LangChain 误识别为模板变量。
     """
-    history = history or []
+    history  = history or []
     messages = [SystemMessage(content=system)]
     for turn in history:
         if turn["role"] == "user":
@@ -100,8 +134,8 @@ def _llm_call(llm: ChatOpenAI, system: str, user_content: str,
 def _parse_json_safe(text: str) -> Optional[dict]:
     cleaned = text.strip()
     if cleaned.startswith("```"):
-        lines = cleaned.splitlines()
-        inner = lines[1:-1] if lines[-1].strip() == "```" else lines[1:]
+        lines   = cleaned.splitlines()
+        inner   = lines[1:-1] if lines[-1].strip() == "```" else lines[1:]
         cleaned = "\n".join(inner)
     try:
         return json.loads(cleaned)
@@ -115,19 +149,12 @@ def _validate_company_id_in_sql(sql: str, company_id: int) -> bool:
     第三道防线：验证 LLM 生成的 SQL 确实包含 company_id 过滤。
     LLM 偶尔可能忽略约束，此处做兜底校验。
     """
-    import re
-    pattern = re.compile(
-        rf"company_id\s*=\s*{company_id}", re.IGNORECASE
-    )
+    pattern = re.compile(rf"company_id\s*=\s*{company_id}", re.IGNORECASE)
     return bool(pattern.search(sql))
 
 
 def _error_response(message: str) -> dict:
-    return {
-        "intent": "job_manage",
-        "data":   {"message": message},
-        "status": "error",
-    }
+    return {"intent": "job_manage", "data": {"message": message}, "status": "error"}
 
 
 # ─────────────────────────────────────────────
@@ -158,9 +185,7 @@ def handle(
         logger.error("[job_manage_agent] llm 未传入")
         return _error_response("系统配置错误，请联系管理员")
 
-    # 动态渲染 System Prompt，注入 company_id（Template.substitute 不受 JSON 花括号干扰）
     system = _SQL_SYSTEM_TEMPLATE.substitute(company_id=company_id)
-
     raw    = _llm_call(llm, system, query, history)
     parsed = _parse_json_safe(raw)
 
@@ -172,12 +197,12 @@ def handle(
     list_sql  = parsed["list_sql"]
     message   = parsed.get("message", "查询公司职位")
 
-    # 第三道防线：校验 SQL 包含 company_id 过滤
+    # 第三道防线：SQL 安全校验
     for sql_name, sql in [("count_sql", count_sql), ("list_sql", list_sql)]:
         if not _validate_company_id_in_sql(sql, company_id):
             logger.error(
-                f"[job_manage_agent] 安全校验失败：{sql_name} 缺少 company_id={company_id} 过滤"
-                f" | SQL: {sql[:100]}"
+                f"[job_manage_agent] 安全校验失败：{sql_name} 缺少 company_id={company_id} "
+                f"| SQL: {sql[:100]}"
             )
             return _error_response("查询生成异常，请重试或联系管理员")
 

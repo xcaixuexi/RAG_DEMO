@@ -1,5 +1,5 @@
 """
-job_search_agent.py — 求职者职位搜索 Agent
+job_search_agent.py — 求职者职位搜索 Agent（Few-Shot 版）
 
 职责：帮助求职者在平台公开职位中搜索符合需求的职位。
 仅服务求职者（jobseeker），角色校验由控制器层保证，本 Agent 不做二次校验。
@@ -14,6 +14,8 @@ API 响应格式：
         },
         "status": "success"
     }
+改进：SQL 生成 Prompt 增加 3 个 Few-Shot 示例，覆盖：
+    单条件 / 多条件 AND / 无精确匹配场景
 """
 
 import json
@@ -30,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────
-# Prompt
+# Prompt（含 Few-Shot 示例）
 # ─────────────────────────────────────────────
 
 _SQL_SYSTEM = """你是一个招聘数据库查询助手，正在帮助一位求职者搜索平台上的公开职位。
@@ -61,12 +63,49 @@ _SQL_SYSTEM = """你是一个招聘数据库查询助手，正在帮助一位求
        contact_name, contact_phone, welfare
     5. count_sql 固定为：SELECT COUNT(*) AS total FROM job WHERE ...
 
-只输出 JSON，格式：
-{{
-    "count_sql": "SELECT COUNT(*) AS total FROM job WHERE ...",
-    "list_sql": "SELECT id, name, ... FROM job WHERE ... LIMIT 50",
-    "message": "一句话说明搜索意图"
-}}"""
+只输出 JSON，不输出任何其他文字，格式：
+{"count_sql": "...", "list_sql": "...", "message": "..."}
+
+═══════════════════════════════════════════════
+Few-Shot 示例
+═══════════════════════════════════════════════
+
+【示例1 — 单条件：城市】
+用户输入: 深圳有哪些职位
+输出:
+{
+    "count_sql": "SELECT COUNT(*) AS total FROM job WHERE status=1 AND is_delete=0 AND audit_status=1 AND work_city LIKE '%深圳%'",
+    "list_sql": "SELECT id, name, company_name, company_logo, salary, salary_min, salary_max, job_exp, education, job_type, job_duty, work_city, contact_name, contact_phone, welfare FROM job WHERE status=1 AND is_delete=0 AND audit_status=1 AND work_city LIKE '%深圳%' LIMIT 50",
+    "message": "搜索深圳地区所有职位"
+}
+
+【示例2 — 多条件 AND：城市 + 岗位 + 薪资】
+用户输入: 上海月薪15k以上的产品经理职位
+输出:
+{
+    "count_sql": "SELECT COUNT(*) AS total FROM job WHERE status=1 AND is_delete=0 AND audit_status=1 AND work_city LIKE '%上海%' AND name LIKE '%产品经理%' AND salary_min >= 15000",
+    "list_sql": "SELECT id, name, company_name, company_logo, salary, salary_min, salary_max, job_exp, education, job_type, job_duty, work_city, contact_name, contact_phone, welfare FROM job WHERE status=1 AND is_delete=0 AND audit_status=1 AND work_city LIKE '%上海%' AND name LIKE '%产品经理%' AND salary_min >= 15000 LIMIT 50",
+    "message": "搜索上海月薪15k以上的产品经理职位"
+}
+
+【示例3 — 多条件 AND：职位类型 + 学历 + 经验】
+用户输入: 本科以上学历3年经验的全职前端工程师
+输出:
+{
+    "count_sql": "SELECT COUNT(*) AS total FROM job WHERE status=1 AND is_delete=0 AND audit_status=1 AND job_type=0 AND name LIKE '%前端%' AND education='本科' AND job_exp='3-5年'",
+    "list_sql": "SELECT id, name, company_name, company_logo, salary, salary_min, salary_max, job_exp, education, job_type, job_duty, work_city, contact_name, contact_phone, welfare FROM job WHERE status=1 AND is_delete=0 AND audit_status=1 AND job_type=0 AND name LIKE '%前端%' AND education='本科' AND job_exp='3-5年' LIMIT 50",
+    "message": "搜索本科学历3-5年经验的全职前端工程师职位"
+}
+
+【示例4 — 职位类型：临时工】
+用户输入: 东莞有没有临时工
+输出:
+{
+    "count_sql": "SELECT COUNT(*) AS total FROM job WHERE status=1 AND is_delete=0 AND audit_status=1 AND work_city LIKE '%东莞%' AND job_type=3",
+    "list_sql": "SELECT id, name, company_name, company_logo, salary, salary_min, salary_max, job_exp, education, job_type, job_duty, work_city, contact_name, contact_phone, welfare FROM job WHERE status=1 AND is_delete=0 AND audit_status=1 AND work_city LIKE '%东莞%' AND job_type=3 LIMIT 50",
+    "message": "搜索东莞地区临时工职位"
+}
+═══════════════════════════════════════════════"""
 
 _NO_RESULT_SYSTEM = """你是一个友好的招聘助手。
 用户搜索职位无结果，请给出简短、友好的建议，引导用户放宽条件重试。
@@ -83,7 +122,7 @@ def _llm_call(llm: ChatOpenAI, system: str, user_content: str,
     直接用 Message 对象构造消息列表，不经过 ChatPromptTemplate。
     避免 system prompt 中的 JSON 花括号被 LangChain 误识别为模板变量。
     """
-    history = history or []
+    history  = history or []
     messages = [SystemMessage(content=system)]
     for turn in history:
         if turn["role"] == "user":
@@ -97,8 +136,8 @@ def _llm_call(llm: ChatOpenAI, system: str, user_content: str,
 def _parse_json_safe(text: str) -> Optional[dict]:
     cleaned = text.strip()
     if cleaned.startswith("```"):
-        lines = cleaned.splitlines()
-        inner = lines[1:-1] if lines[-1].strip() == "```" else lines[1:]
+        lines  = cleaned.splitlines()
+        inner  = lines[1:-1] if lines[-1].strip() == "```" else lines[1:]
         cleaned = "\n".join(inner)
     try:
         return json.loads(cleaned)
@@ -108,11 +147,7 @@ def _parse_json_safe(text: str) -> Optional[dict]:
 
 
 def _error_response(message: str) -> dict:
-    return {
-        "intent": "job_search",
-        "data":   {"message": message},
-        "status": "error",
-    }
+    return {"intent": "job_search", "data": {"message": message}, "status": "error"}
 
 
 # ─────────────────────────────────────────────
@@ -163,14 +198,10 @@ def handle(
         total = len(jobs)
 
     if not jobs:
-        guide = _llm_call(
-            llm,
-            _NO_RESULT_SYSTEM,
-            f"用户查询：{query}\n搜索条件：{message}",
-        )
+        guide = _llm_call(llm, _NO_RESULT_SYSTEM, f"用户查询：{query}\n搜索条件：{message}")
         return {
             "intent": "job_search",
-            "data": {"total": 0, "jobs": [], "message": guide},
+            "data":   {"total": 0, "jobs": [], "message": guide},
             "status": "success",
         }
 

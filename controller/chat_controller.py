@@ -1,5 +1,5 @@
 """
-chat_controller.py — 对话控制器
+controller/chat_controller.py — 对话控制器（重构版）
 
 职责：
     1. 持有 Supervisor 实例，调用两级路由（规则层 + LLM 层）
@@ -12,6 +12,10 @@ chat_controller.py — 对话控制器
     第一道：LLM 路由层（supervisor.py）— 感知角色，减少越权意图生成概率
     第二道：控制器层（本文件）— 白名单硬校验，意图不在白名单直接返回 permission_denied
     第三道：Agent 层 — job_manage/candidate_search 的 SQL 强制携带 company_id
+主要改进：
+    1. 使用 Supervisor.get_instance() 获取单例，不再每次请求新建
+    2. route() 调用时传入上一轮 intent/query，支持上下文感知路由
+    3. session 中记录 last_intent/last_query，供下次请求读取
 """
 
 import logging
@@ -33,7 +37,7 @@ logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────
-# 权限控制常量
+# 权限控制常量（不变）
 # ─────────────────────────────────────────────
 
 _ROLE_INTENT_WHITELIST: dict[str, set[str]] = {
@@ -68,19 +72,12 @@ _PERMISSION_DENIED_MESSAGES: dict = {
 
 class ChatController:
     """
-    对话控制器 - 协调 Supervisor 路由与各 Agent 执行。
+    对话控制器（单例 Supervisor 版）。
 
-    路由流程（两级漏斗）：
-        用户输入
-            ↓
-        [Level-1] 规则路由 (RuleRouter)  — 不感知角色
-            命中 ──→ 控制器权限校验
-            ↓ 未命中
-        [Level-2] LLM 路由 (query_router) — 感知角色
-            ↓
-        [控制器] 白名单权限校验
-            通过 → 调用 Agent
-            拒绝 → 返回 permission_denied
+    变化：
+        - self.supervisor 通过 Supervisor.get_instance() 获取，进程内共享
+        - process_message() 读取并传递 prev_intent/prev_query，实现上下文路由
+        - process_message() 路由完成后将本轮 intent/query 写回 session
     """
 
     def __init__(
@@ -99,12 +96,12 @@ class ChatController:
         self.user_role  = user_role
         self.user_id    = user_id
         self.session_id = session_id
-        self._pending_file_path = None   # CLI 场景暂存待解析的文件路径
+        self._pending_file_path = None
 
-        self.supervisor = Supervisor(
-            temperature=0.0,
-            rule_confidence_threshold=1,
-            enable_rule_router=True,
+        # ── 获取单例 Supervisor（不重复初始化 LLM）──
+        self.supervisor = Supervisor.get_instance(
+            rule_confidence_threshold = 1,
+            enable_rule_router        = True,
         )
 
         self._agent_map = {
@@ -130,6 +127,23 @@ class ChatController:
         """
         session_manager.append_history(self.session_id, agent_type, query, reply)
 
+    def _get_last_route(self) -> tuple[Optional[str], Optional[str]]:
+        """
+        读取上一轮路由结果（intent + query），用于上下文感知路由。
+        存储在 session 的特殊 key "__route__" 中。
+        """
+        history = session_manager.get_history(self.session_id, "__route__")
+        if not history:
+            return None, None
+        # 最后两条是 {"role": "user", "content": query} 和 {"role": "assistant", "content": intent}
+        if len(history) >= 2:
+            return history[-1]["content"], history[-2]["content"]
+        return None, None
+
+    def _save_last_route(self, query: str, intent: str) -> None:
+        """将本轮路由结果写入 session，供下次请求继承"""
+        session_manager.append_history(self.session_id, "__route__", query, intent)
+
     # ==================== 对外主接口 ====================
 
     def process_message(self, user_input: str) -> dict:
@@ -141,12 +155,24 @@ class ChatController:
 
         Returns:
             {"intent": "...", "data": {"message": "..."}, "status": "success"/"error"}
+        新增：读取上一轮路由信息并传入 supervisor.route()，解决指代/省略句问题。
         """
         try:
-            # 路由：规则层（不感知角色）→ LLM 层（感知角色）
-            processed_query, intent = self.supervisor.route(user_input, self.user_role)
+            # 读取上下文
+            prev_intent, prev_query = self._get_last_route()
 
-            # 权限校验（第二道防线）
+            # 两级路由（传入历史上下文）
+            processed_query, intent = self.supervisor.route(
+                user_input,
+                self.user_role,
+                prev_intent = prev_intent,
+                prev_query  = prev_query,
+            )
+
+            # 保存本轮路由结果
+            self._save_last_route(user_input, intent)
+
+            # 权限校验
             allowed = _ROLE_INTENT_WHITELIST.get(self.user_role, set())
             if intent not in allowed:
                 msg = (
@@ -229,18 +255,15 @@ class ChatController:
         """
         if hasattr(self, "_cached_company_id"):
             return self._cached_company_id
-
         from db.mysql_client import MySQLClient
-        db = MySQLClient()
+        db = MySQLClient.get_instance()
         company = db.get_company_by_user_id(self.user_id)
         self._cached_company_id = company.id if company else None
-
         if self._cached_company_id is None:
             logger.warning(f"[权限] user_id={self.user_id} 未关联已审核企业")
-
         return self._cached_company_id
 
-    # ==================== 各 Agent 调用封装 ====================
+    # ==================== Agent 调用封装 ====================
 
     def _call_chitchat(self, query: str) -> dict:
         """调用 chitchat_agent，传入历史、llm 实例和 user_role。"""
