@@ -7,6 +7,7 @@ from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
 from langchain_openai import ChatOpenAI
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
+from utils.timer import timed
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +102,7 @@ class Supervisor:
         return llm
 
     # ==================== 对外主接口 ====================
-
+    @timed("路由主管总耗时")
     def route(self, query: str, user_role: str = "jobseeker") -> tuple[str, Intent]:
         """
         两级路由主入口，供 ChatController 调用。
@@ -214,7 +215,7 @@ class Supervisor:
         return response
 
     # ==================== 查询路由（意图识别） ====================
-
+    @timed("LLM路由")
     def query_router(self, query: str, user_role: str = "jobseeker") -> Intent:
         """
         LLM 路由，感知用户角色。即便角色不匹配也如实输出意图，

@@ -24,6 +24,28 @@ logger = logging.getLogger(__name__)
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 
+import logging
+import os
+
+def _setup_logging():
+    os.makedirs("logs", exist_ok=True)
+    root = logging.getLogger()
+    if root.handlers:   # 防止 reload 时重复添加
+        return
+    root.setLevel(logging.INFO)
+    fmt = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    console = logging.StreamHandler()
+    console.setFormatter(fmt)
+    root.addHandler(console)
+    file_handler = logging.FileHandler("logs/app.log", encoding="utf-8")
+    file_handler.setFormatter(fmt)
+    root.addHandler(file_handler)
+
+_setup_logging()
+
 app = FastAPI(title="招聘AI助手", version="1.0.0")
 
 # ── CORS（开发阶段放开，生产按需收紧）────────

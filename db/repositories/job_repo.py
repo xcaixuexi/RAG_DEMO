@@ -16,6 +16,7 @@ from typing import Optional
 from sqlalchemy import text
 
 from db.mysql_client import MySQLClient
+from utils.timer import timed
 
 logger = logging.getLogger(__name__)
 
@@ -132,7 +133,7 @@ class JobRepo:
         self._db = db or MySQLClient()
 
     # ── 求职者：执行 LLM 生成的职位查询 SQL ──────
-
+    @timed("职位查询")
     def execute_job_query(self, sql: str) -> list[dict]:
         """
         执行 LLM 生成的 SELECT SQL（求职者职位查询），返回职位列表。
@@ -153,6 +154,7 @@ class JobRepo:
             logger.error(f"[job_repo] SQL 执行失败: {e} | SQL: {sql[:200]}")
             return []
 
+    @timed("候选人查询")
     def execute_apply_query(self, sql: str) -> list[dict]:
         """
         执行 LLM 生成的 SELECT SQL（招聘者候选人查询），返回候选人列表。
@@ -174,6 +176,7 @@ class JobRepo:
             logger.error(f"[job_repo] apply SQL 执行失败: {e} | SQL: {sql[:200]}")
             return []
 
+    @timed("统计查询")
     def execute_count_query(self, sql: str) -> int:
         """
         执行统计查询，返回数量。
@@ -210,6 +213,7 @@ class JobRepo:
 
     # ── 招聘者：按职位查询候选人 ─────────────────
 
+    @timed("按职位查询候选人")
     def get_candidates_by_job(self, job_id: int) -> list[dict]:
         """
         按 job_id 三表 JOIN 查询报名记录，返回候选人完整信息列表。
@@ -251,6 +255,7 @@ class JobRepo:
             logger.error(f"[job_repo] get_candidates_by_job 失败: {e}")
             return []
 
+    @timed("按职位名称查询候选人")
     def get_candidates_by_job_name(self, job_name: str) -> list[dict]:
         """
         按职位名称模糊三表 JOIN 查询报名记录。
