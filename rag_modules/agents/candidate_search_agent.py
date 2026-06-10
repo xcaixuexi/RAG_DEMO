@@ -1,5 +1,5 @@
 """
-candidate_search_agent.py — 招聘者候选人查询 Agent（Few-Shot 版）
+candidate_search_agent.py — 招聘者候选人查询 Agent（分页版）
 
 职责：帮助招聘者查询自己公司职位的候选人和报名情况。
 仅服务招聘者（recruiter），SQL 强制注入 company_id 过滤实现数据隔离。
@@ -15,6 +15,7 @@ API 响应格式：
         "status": "success"
     }
 改进：SQL 生成 Prompt 增加 3 个 Few-Shot 示例。
+改动：SQL 固定 LIMIT 100，结果写入 session 缓存，返回第 1 页切片。
 """
 
 import json
@@ -28,9 +29,14 @@ from langchain_openai import ChatOpenAI
 from langchain_core.output_parsers import StrOutputParser
 
 from db.repositories.job_repo import JobRepo
+from controller.session_manager import (
+    save_page_cache, get_page,
+    MAX_FETCH, DEFAULT_PAGE_SIZE,
+)
 
 logger = logging.getLogger(__name__)
 
+RESULT_TYPE = "candidates"
 
 # ─────────────────────────────────────────────
 # Prompt（动态注入 company_id + Few-Shot）
@@ -66,7 +72,7 @@ _SQL_SYSTEM_TEMPLATE = Template("""你是一个招聘数据库查询助手，正
 
 固定规则：
     1. WHERE 必须包含 ea.company_id = $company_id AND ea.status != 5
-    2. list_sql 加 ORDER BY ea.create_time DESC 和 LIMIT 50
+    2. list_sql 加 ORDER BY ea.create_time DESC 和 LIMIT 100（固定，不可更改）
     3. count_sql 不加 LIMIT
 
 list_sql 固定 SELECT 字段：
@@ -87,7 +93,7 @@ Few-Shot 示例（company_id 均用 $company_id）
 输出:
 {
     "count_sql": "SELECT COUNT(*) AS total FROM employees_apply ea LEFT JOIN job j ON ea.job_id = j.id LEFT JOIN company c ON ea.company_id = c.id WHERE ea.company_id = $company_id AND ea.status != 5 AND (j.name LIKE '%产品经理%' OR ea.job_name LIKE '%产品经理%')",
-    "list_sql": "SELECT ea.id as apply_id, ea.user_id, ea.resume_id, ea.job_id, COALESCE(j.name, ea.job_name) as job_name, ea.company_id, COALESCE(c.name, ea.work_company_name) as company_name, ea.expected_salary, ea.status, ea.audit_type, ea.emp_way, ea.create_time, ea.audit_time, ea.cancel_time, ea.remark, ea.reason FROM employees_apply ea LEFT JOIN job j ON ea.job_id = j.id LEFT JOIN company c ON ea.company_id = c.id WHERE ea.company_id = $company_id AND ea.status != 5 AND (j.name LIKE '%产品经理%' OR ea.job_name LIKE '%产品经理%') ORDER BY ea.create_time DESC LIMIT 50",
+    "list_sql": "SELECT ea.id as apply_id, ea.user_id, ea.resume_id, ea.job_id, COALESCE(j.name, ea.job_name) as job_name, ea.company_id, COALESCE(c.name, ea.work_company_name) as company_name, ea.expected_salary, ea.status, ea.audit_type, ea.emp_way, ea.create_time, ea.audit_time, ea.cancel_time, ea.remark, ea.reason FROM employees_apply ea LEFT JOIN job j ON ea.job_id = j.id LEFT JOIN company c ON ea.company_id = c.id WHERE ea.company_id = $company_id AND ea.status != 5 AND (j.name LIKE '%产品经理%' OR ea.job_name LIKE '%产品经理%') ORDER BY ea.create_time DESC LIMIT 100",
     "message": "查询产品经理职位的报名情况"
 }
 
@@ -96,7 +102,7 @@ Few-Shot 示例（company_id 均用 $company_id）
 输出:
 {
     "count_sql": "SELECT COUNT(*) AS total FROM employees_apply ea LEFT JOIN job j ON ea.job_id = j.id LEFT JOIN company c ON ea.company_id = c.id WHERE ea.company_id = $company_id AND ea.status != 5 AND (j.name LIKE '%前端%' OR ea.job_name LIKE '%前端%') AND ea.audit_type = 1",
-    "list_sql": "SELECT ea.id as apply_id, ea.user_id, ea.resume_id, ea.job_id, COALESCE(j.name, ea.job_name) as job_name, ea.company_id, COALESCE(c.name, ea.work_company_name) as company_name, ea.expected_salary, ea.status, ea.audit_type, ea.emp_way, ea.create_time, ea.audit_time, ea.cancel_time, ea.remark, ea.reason FROM employees_apply ea LEFT JOIN job j ON ea.job_id = j.id LEFT JOIN company c ON ea.company_id = c.id WHERE ea.company_id = $company_id AND ea.status != 5 AND (j.name LIKE '%前端%' OR ea.job_name LIKE '%前端%') AND ea.audit_type = 1 ORDER BY ea.create_time DESC LIMIT 50",
+    "list_sql": "SELECT ea.id as apply_id, ea.user_id, ea.resume_id, ea.job_id, COALESCE(j.name, ea.job_name) as job_name, ea.company_id, COALESCE(c.name, ea.work_company_name) as company_name, ea.expected_salary, ea.status, ea.audit_type, ea.emp_way, ea.create_time, ea.audit_time, ea.cancel_time, ea.remark, ea.reason FROM employees_apply ea LEFT JOIN job j ON ea.job_id = j.id LEFT JOIN company c ON ea.company_id = c.id WHERE ea.company_id = $company_id AND ea.status != 5 AND (j.name LIKE '%前端%' OR ea.job_name LIKE '%前端%') AND ea.audit_type = 1 ORDER BY ea.create_time DESC LIMIT 100",
     "message": "查询前端工程师职位待审核的候选人"
 }
 
@@ -105,7 +111,7 @@ Few-Shot 示例（company_id 均用 $company_id）
 输出:
 {
     "count_sql": "SELECT COUNT(*) AS total FROM employees_apply ea LEFT JOIN job j ON ea.job_id = j.id LEFT JOIN company c ON ea.company_id = c.id WHERE ea.company_id = $company_id AND ea.status != 5",
-    "list_sql": "SELECT ea.id as apply_id, ea.user_id, ea.resume_id, ea.job_id, COALESCE(j.name, ea.job_name) as job_name, ea.company_id, COALESCE(c.name, ea.work_company_name) as company_name, ea.expected_salary, ea.status, ea.audit_type, ea.emp_way, ea.create_time, ea.audit_time, ea.cancel_time, ea.remark, ea.reason FROM employees_apply ea LEFT JOIN job j ON ea.job_id = j.id LEFT JOIN company c ON ea.company_id = c.id WHERE ea.company_id = $company_id AND ea.status != 5 ORDER BY ea.create_time DESC LIMIT 50",
+    "list_sql": "SELECT ea.id as apply_id, ea.user_id, ea.resume_id, ea.job_id, COALESCE(j.name, ea.job_name) as job_name, ea.company_id, COALESCE(c.name, ea.work_company_name) as company_name, ea.expected_salary, ea.status, ea.audit_type, ea.emp_way, ea.create_time, ea.audit_time, ea.cancel_time, ea.remark, ea.reason FROM employees_apply ea LEFT JOIN job j ON ea.job_id = j.id LEFT JOIN company c ON ea.company_id = c.id WHERE ea.company_id = $company_id AND ea.status != 5 ORDER BY ea.create_time DESC LIMIT 100",
     "message": "查询公司所有报名记录"
 }
 ═══════════════════════════════════════════════""")
@@ -124,10 +130,8 @@ def _llm_call(llm: ChatOpenAI, system: str, user_content: str,
     history  = history or []
     messages = [SystemMessage(content=system)]
     for turn in history:
-        if turn["role"] == "user":
-            messages.append(HumanMessage(content=turn["content"]))
-        else:
-            messages.append(AIMessage(content=turn["content"]))
+        cls = HumanMessage if turn["role"] == "user" else AIMessage
+        messages.append(cls(content=turn["content"]))
     messages.append(HumanMessage(content=user_content))
     return (llm | StrOutputParser()).invoke(messages).strip()
 
@@ -141,29 +145,44 @@ def _parse_json_safe(text: str) -> Optional[dict]:
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError as e:
-        logger.error(f"[candidate_search_agent] JSON 解析失败: {e} | 原文: {text[:200]}")
+        logger.error(f"[candidate_search_agent] JSON 解析失败: {e}")
         return None
 
 
-def _validate_company_id_in_sql(sql: str, company_id: int) -> bool:
+def _validate_company_id(sql: str, company_id: int) -> bool:
     """第三道防线：验证 SQL 包含 ea.company_id 或 company_id 过滤"""
-    pattern = re.compile(rf"(ea\.)?company_id\s*=\s*{company_id}", re.IGNORECASE)
-    return bool(pattern.search(sql))
+    return bool(re.compile(rf"(ea\.)?company_id\s*=\s*{company_id}", re.IGNORECASE).search(sql))
 
 
-def _error_response(message: str) -> dict:
+def _error_response(message):
     return {"intent": "candidate_search", "data": {"message": message}, "status": "error"}
 
 
-# ─────────────────────────────────────────────
-# 对外接口
-# ─────────────────────────────────────────────
+def _build_response(page_data, total_db, message):
+    return {
+        "intent": "candidate_search",
+        "data": {
+            "message":     message,
+            "candidates":  page_data["items"],
+            "pagination": {
+                "page":        page_data["page"],
+                "page_size":   page_data["page_size"],
+                "total_pages": page_data["total_pages"],
+                "fetched":     page_data["fetched"],
+                "total_db":    total_db,
+            },
+        },
+        "status": "success",
+    }
+
 
 def handle(
     query:      str,
+    session_id: str,
     company_id: int,
     history:    Optional[list[dict]] = None,
-    llm:        Optional[ChatOpenAI] = None,
+    llm = None,
+    page_size:  int = DEFAULT_PAGE_SIZE,
 ) -> dict:
     """
     招聘者候选人查询 Agent 主入口。
@@ -194,33 +213,50 @@ def handle(
 
     count_sql = parsed["count_sql"]
     list_sql  = parsed["list_sql"]
-    message   = parsed.get("message", "查询候选人")
+    llm_msg   = parsed.get("message", "查询候选人")
 
     # 第三道防线：SQL 安全校验
     for sql_name, sql in [("count_sql", count_sql), ("list_sql", list_sql)]:
-        if not _validate_company_id_in_sql(sql, company_id):
+        if not _validate_company_id(sql, company_id):
             logger.error(
-                f"[candidate_search_agent] 安全校验失败：{sql_name} 缺少 company_id={company_id} "
-                f"| SQL: {sql[:100]}"
-            )
+                f"[candidate_search_agent] 安全校验失败：{sql_name} 缺少 company_id={company_id} ")
             return _error_response("查询生成异常，请重试或联系管理员")
 
     logger.info(f"[candidate_search_agent] count_sql: {count_sql}")
     logger.info(f"[candidate_search_agent] list_sql:  {list_sql}")
 
     repo       = JobRepo()
-    total      = repo.execute_count_query(count_sql)
+    total_db   = repo.execute_count_query(count_sql)
     candidates = repo.execute_apply_query(list_sql)
 
-    if total < 0:
-        total = len(candidates)
+    if total_db < 0:
+        total_db = len(candidates)
 
-    return {
-        "intent": "candidate_search",
-        "data": {
-            "total":      total,
-            "candidates": candidates,
-            "message":    f"{message}，共 {total} 条记录",
-        },
-        "status": "success",
-    }
+    if not candidates:
+        return {
+            "intent": "candidate_search",
+            "data": {
+                "message": f"{llm_msg}，暂无符合条件的候选人",
+                "candidates": [],
+                "pagination": {
+                    "page": 1, "page_size": page_size,
+                    "total_pages": 0, "fetched": 0, "total_db": 0,
+                },
+            },
+            "status": "success",
+        }
+
+    save_page_cache(
+        session_id  = session_id,
+        result_type = RESULT_TYPE,
+        items       = candidates,
+        total_db    = total_db,
+        query       = query,
+    )
+
+    page_data = get_page(session_id, RESULT_TYPE, page=1, page_size=page_size)
+    fetched   = len(candidates)
+    hint = f"（数据库共 {total_db} 条，已为您加载前 {fetched} 条）" if total_db > fetched else ""
+    message = f"{llm_msg}，共 {fetched} 条记录{hint}"
+
+    return _build_response(page_data, total_db, message)

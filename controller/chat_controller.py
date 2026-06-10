@@ -245,7 +245,7 @@ class ChatController:
             session_manager.clear_session(self.session_id)
         logger.info(f"历史已清空: session={self.session_id} agent={agent_type or 'all'}")
 
-    # ==================== company_id 获取（招聘者专用）====================
+    # ==================== company_id 获取 ====================
 
     def _get_company_id(self) -> Optional[int]:
         """
@@ -308,9 +308,10 @@ class ChatController:
         """求职者职位搜索，无需 company_id。"""
         history  = self._get_history("job_search")
         response = job_search_agent.handle(
-            query   = query,
-            history = history,
-            llm     = self.supervisor.llm,
+            query      = query,
+            session_id = self.session_id,
+            history    = history,
+            llm        = self.supervisor.llm,
         )
         self._append_history("job_search", query, response["data"]["message"])
         return response
@@ -327,6 +328,7 @@ class ChatController:
         history  = self._get_history("job_manage")
         response = job_manage_agent.handle(
             query      = query,
+            session_id = self.session_id,
             company_id = company_id,
             history    = history,
             llm        = self.supervisor.llm,
@@ -346,6 +348,7 @@ class ChatController:
         history  = self._get_history("candidate_search")
         response = candidate_search_agent.handle(
             query      = query,
+            session_id = self.session_id,
             company_id = company_id,
             history    = history,
             llm        = self.supervisor.llm,

@@ -1,5 +1,5 @@
 """
-job_search_agent.py — 求职者职位搜索 Agent（Few-Shot 版）
+job_search_agent.py — 求职者职位搜索 Agent（分页版）
 
 职责：帮助求职者在平台公开职位中搜索符合需求的职位。
 仅服务求职者（jobseeker），角色校验由控制器层保证，本 Agent 不做二次校验。
@@ -16,6 +16,10 @@ API 响应格式：
     }
 改进：SQL 生成 Prompt 增加 3 个 Few-Shot 示例，覆盖：
     单条件 / 多条件 AND / 无精确匹配场景
+改动：
+    - SQL 固定 LIMIT 100（MAX_FETCH），不再由 LLM 决定
+    - handle() 返回第 1 页切片 + 分页元信息，同时将全量数据写入 session 缓存
+    - 新增 result_type = "jobs"，供翻页接口识别缓存类型
 """
 
 import json
@@ -27,9 +31,14 @@ from langchain_openai import ChatOpenAI
 from langchain_core.output_parsers import StrOutputParser
 
 from db.repositories.job_repo import JobRepo
+from controller.session_manager import (
+    save_page_cache, get_page,
+    MAX_FETCH, DEFAULT_PAGE_SIZE,
+)
 
 logger = logging.getLogger(__name__)
 
+RESULT_TYPE = "jobs"
 
 # ─────────────────────────────────────────────
 # Prompt（含 Few-Shot 示例）
@@ -56,7 +65,7 @@ _SQL_SYSTEM = """你是一个招聘数据库查询助手，正在帮助一位求
 固定规则：
     1. WHERE 条件必须包含 status=1 AND is_delete=0 AND audit_status=1
     2. 条件不确定时宁可不加，不要强行猜测
-    3. list_sql 必须加 LIMIT 50
+    3. list_sql 必须加 LIMIT 100（固定值，不可更改）
     4. list_sql SELECT 字段固定为：
        id, name, company_name, company_logo, salary, salary_min, salary_max,
        job_exp, education, job_type, job_duty, work_city,
@@ -75,7 +84,7 @@ Few-Shot 示例
 输出:
 {
     "count_sql": "SELECT COUNT(*) AS total FROM job WHERE status=1 AND is_delete=0 AND audit_status=1 AND work_city LIKE '%深圳%'",
-    "list_sql": "SELECT id, name, company_name, company_logo, salary, salary_min, salary_max, job_exp, education, job_type, job_duty, work_city, contact_name, contact_phone, welfare FROM job WHERE status=1 AND is_delete=0 AND audit_status=1 AND work_city LIKE '%深圳%' LIMIT 50",
+    "list_sql": "SELECT id, name, company_name, company_logo, salary, salary_min, salary_max, job_exp, education, job_type, job_duty, work_city, contact_name, contact_phone, welfare FROM job WHERE status=1 AND is_delete=0 AND audit_status=1 AND work_city LIKE '%深圳%' LIMIT 100",
     "message": "搜索深圳地区所有职位"
 }
 
@@ -84,7 +93,7 @@ Few-Shot 示例
 输出:
 {
     "count_sql": "SELECT COUNT(*) AS total FROM job WHERE status=1 AND is_delete=0 AND audit_status=1 AND work_city LIKE '%上海%' AND name LIKE '%产品经理%' AND salary_min >= 15000",
-    "list_sql": "SELECT id, name, company_name, company_logo, salary, salary_min, salary_max, job_exp, education, job_type, job_duty, work_city, contact_name, contact_phone, welfare FROM job WHERE status=1 AND is_delete=0 AND audit_status=1 AND work_city LIKE '%上海%' AND name LIKE '%产品经理%' AND salary_min >= 15000 LIMIT 50",
+    "list_sql": "SELECT id, name, company_name, company_logo, salary, salary_min, salary_max, job_exp, education, job_type, job_duty, work_city, contact_name, contact_phone, welfare FROM job WHERE status=1 AND is_delete=0 AND audit_status=1 AND work_city LIKE '%上海%' AND name LIKE '%产品经理%' AND salary_min >= 15000 LIMIT 100",
     "message": "搜索上海月薪15k以上的产品经理职位"
 }
 
@@ -93,7 +102,7 @@ Few-Shot 示例
 输出:
 {
     "count_sql": "SELECT COUNT(*) AS total FROM job WHERE status=1 AND is_delete=0 AND audit_status=1 AND job_type=0 AND name LIKE '%前端%' AND education='本科' AND job_exp='3-5年'",
-    "list_sql": "SELECT id, name, company_name, company_logo, salary, salary_min, salary_max, job_exp, education, job_type, job_duty, work_city, contact_name, contact_phone, welfare FROM job WHERE status=1 AND is_delete=0 AND audit_status=1 AND job_type=0 AND name LIKE '%前端%' AND education='本科' AND job_exp='3-5年' LIMIT 50",
+    "list_sql": "SELECT id, name, company_name, company_logo, salary, salary_min, salary_max, job_exp, education, job_type, job_duty, work_city, contact_name, contact_phone, welfare FROM job WHERE status=1 AND is_delete=0 AND audit_status=1 AND job_type=0 AND name LIKE '%前端%' AND education='本科' AND job_exp='3-5年' LIMIT 100",
     "message": "搜索本科学历3-5年经验的全职前端工程师职位"
 }
 
@@ -102,7 +111,7 @@ Few-Shot 示例
 输出:
 {
     "count_sql": "SELECT COUNT(*) AS total FROM job WHERE status=1 AND is_delete=0 AND audit_status=1 AND work_city LIKE '%东莞%' AND job_type=3",
-    "list_sql": "SELECT id, name, company_name, company_logo, salary, salary_min, salary_max, job_exp, education, job_type, job_duty, work_city, contact_name, contact_phone, welfare FROM job WHERE status=1 AND is_delete=0 AND audit_status=1 AND work_city LIKE '%东莞%' AND job_type=3 LIMIT 50",
+    "list_sql": "SELECT id, name, company_name, company_logo, salary, salary_min, salary_max, job_exp, education, job_type, job_duty, work_city, contact_name, contact_phone, welfare FROM job WHERE status=1 AND is_delete=0 AND audit_status=1 AND work_city LIKE '%东莞%' AND job_type=3 LIMIT 100",
     "message": "搜索东莞地区临时工职位"
 }
 ═══════════════════════════════════════════════"""
@@ -125,10 +134,8 @@ def _llm_call(llm: ChatOpenAI, system: str, user_content: str,
     history  = history or []
     messages = [SystemMessage(content=system)]
     for turn in history:
-        if turn["role"] == "user":
-            messages.append(HumanMessage(content=turn["content"]))
-        else:
-            messages.append(AIMessage(content=turn["content"]))
+        cls = HumanMessage if turn["role"] == "user" else AIMessage
+        messages.append(cls(content=turn["content"]))
     messages.append(HumanMessage(content=user_content))
     return (llm | StrOutputParser()).invoke(messages).strip()
 
@@ -136,8 +143,8 @@ def _llm_call(llm: ChatOpenAI, system: str, user_content: str,
 def _parse_json_safe(text: str) -> Optional[dict]:
     cleaned = text.strip()
     if cleaned.startswith("```"):
-        lines  = cleaned.splitlines()
-        inner  = lines[1:-1] if lines[-1].strip() == "```" else lines[1:]
+        lines   = cleaned.splitlines()
+        inner   = lines[1:-1] if lines[-1].strip() == "```" else lines[1:]
         cleaned = "\n".join(inner)
     try:
         return json.loads(cleaned)
@@ -150,25 +157,45 @@ def _error_response(message: str) -> dict:
     return {"intent": "job_search", "data": {"message": message}, "status": "error"}
 
 
+def _build_response(page_data: dict, total_db: int, message: str) -> dict:
+    """组装统一分页响应格式"""
+    return {
+        "intent": "job_search",
+        "data": {
+            "message":     message,
+            "jobs":        page_data["items"],
+            "pagination": {
+                "page":        page_data["page"],
+                "page_size":   page_data["page_size"],
+                "total_pages": page_data["total_pages"],
+                "fetched":     page_data["fetched"],
+                "total_db":    total_db,
+            },
+        },
+        "status": "success",
+    }
+
+
 # ─────────────────────────────────────────────
 # 对外接口
 # ─────────────────────────────────────────────
 
 def handle(
-    query:   str,
-    history: Optional[list[dict]] = None,
-    llm:     Optional[ChatOpenAI] = None,
+    query:      str,
+    session_id: str,
+    history:    Optional[list[dict]] = None,
+    llm = None,
+    page_size:  int = DEFAULT_PAGE_SIZE,
 ) -> dict:
     """
-    求职者职位搜索 Agent 主入口。
+    首次查询入口：LLM 生成 SQL → 查 DB → 缓存全量 → 返回第 1 页。
 
     Args:
-        query:   用户输入
-        history: 多轮对话历史（最多 5 轮）
-        llm:     ChatOpenAI 实例
-
-    Returns:
-        统一响应字典
+        query:      用户输入
+        session_id: 会话 ID，用于写入分页缓存
+        history:    多轮对话历史
+        llm:        ChatOpenAI 实例
+        page_size:  每页条数，默认 20
     """
     history = history or []
 
@@ -185,32 +212,47 @@ def handle(
 
     count_sql = parsed["count_sql"]
     list_sql  = parsed["list_sql"]
-    message   = parsed.get("message", "为您搜索匹配职位")
+    llm_msg   = parsed.get("message", "为您搜索匹配职位")
 
     logger.info(f"[job_search_agent] count_sql: {count_sql}")
     logger.info(f"[job_search_agent] list_sql:  {list_sql}")
 
-    repo  = JobRepo()
-    total = repo.execute_count_query(count_sql)
-    jobs  = repo.execute_job_query(list_sql)
+    repo     = JobRepo()
+    total_db = repo.execute_count_query(count_sql)
+    jobs     = repo.execute_job_query(list_sql)     # SQL 已含 LIMIT 100
 
-    if total < 0:
-        total = len(jobs)
+    if total_db < 0:
+        total_db = len(jobs)
 
     if not jobs:
-        guide = _llm_call(llm, _NO_RESULT_SYSTEM, f"用户查询：{query}\n搜索条件：{message}")
+        guide = _llm_call(llm, _NO_RESULT_SYSTEM, f"用户查询：{query}\n搜索条件：{llm_msg}")
         return {
             "intent": "job_search",
-            "data":   {"total": 0, "jobs": [], "message": guide},
+            "data": {
+                "message": guide,
+                "jobs":    [],
+                "pagination": {
+                    "page": 1, "page_size": page_size,
+                    "total_pages": 0, "fetched": 0, "total_db": 0,
+                },
+            },
             "status": "success",
         }
 
-    return {
-        "intent": "job_search",
-        "data": {
-            "total":   total,
-            "jobs":    jobs,
-            "message": f"{message}，共找到 {total} 个职位",
-        },
-        "status": "success",
-    }
+    # 写入分页缓存
+    save_page_cache(
+        session_id  = session_id,
+        result_type = RESULT_TYPE,
+        items       = jobs,
+        total_db    = total_db,
+        query       = query,
+    )
+
+    # 取第 1 页
+    page_data = get_page(session_id, RESULT_TYPE, page=1, page_size=page_size)
+    fetched   = len(jobs)
+
+    hint = f"（数据库共 {total_db} 条，已为您加载前 {fetched} 条）" if total_db > fetched else ""
+    message = f"{llm_msg}，共找到 {fetched} 个职位{hint}"
+
+    return _build_response(page_data, total_db, message)

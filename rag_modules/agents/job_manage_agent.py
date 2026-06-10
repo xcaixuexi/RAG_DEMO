@@ -1,5 +1,5 @@
 """
-job_manage_agent.py — 招聘者职位管理 Agent（Few-Shot 版）
+job_manage_agent.py — 招聘者职位管理 Agent（分页版）
 
 职责：帮助招聘者查看/管理自己公司发布的职位。
 仅服务招聘者（recruiter），且 SQL 强制注入 company_id 过滤，
@@ -16,6 +16,7 @@ API 响应格式：
         "status": "success"
     }
 改进：SQL 生成 Prompt 增加 3 个 Few-Shot 示例。
+改动：SQL 固定 LIMIT 100，结果写入 session 缓存，返回第 1 页切片。
 """
 
 import json
@@ -29,9 +30,14 @@ from langchain_openai import ChatOpenAI
 from langchain_core.output_parsers import StrOutputParser
 
 from db.repositories.job_repo import JobRepo
+from controller.session_manager import (
+    save_page_cache, get_page,
+    MAX_FETCH, DEFAULT_PAGE_SIZE,
+)
 
 logger = logging.getLogger(__name__)
 
+RESULT_TYPE = "jobs"
 
 # ─────────────────────────────────────────────
 # Prompt（动态注入 company_id + Few-Shot）
@@ -59,7 +65,7 @@ _SQL_SYSTEM_TEMPLATE = Template("""你是一个招聘数据库查询助手，正
     1. WHERE 必须包含 company_id = $company_id AND is_delete = 0
     2. 查询"在招/发布中"的职位时加 status=1 AND audit_status=1
     3. 用户未指定状态时默认查询全部未删除职位（不加 status 过滤）
-    4. list_sql 加 LIMIT 50 和 ORDER BY deploy_time DESC
+    4. list_sql 加 LIMIT 100（固定，不可更改）和 ORDER BY deploy_time DESC
     5. list_sql SELECT 字段固定为：
        id, name, company_name, company_logo, salary, salary_min, salary_max,
        job_exp, education, job_type, job_duty, work_city,
@@ -77,7 +83,7 @@ Few-Shot 示例（company_id 均用 $company_id）
 输出:
 {
     "count_sql": "SELECT COUNT(*) AS total FROM job WHERE company_id = $company_id AND is_delete = 0 AND status = 1 AND audit_status = 1",
-    "list_sql": "SELECT id, name, company_name, company_logo, salary, salary_min, salary_max, job_exp, education, job_type, job_duty, work_city, contact_name, contact_phone, welfare, status, audit_status FROM job WHERE company_id = $company_id AND is_delete = 0 AND status = 1 AND audit_status = 1 ORDER BY deploy_time DESC LIMIT 50",
+    "list_sql": "SELECT id, name, company_name, company_logo, salary, salary_min, salary_max, job_exp, education, job_type, job_duty, work_city, contact_name, contact_phone, welfare, status, audit_status FROM job WHERE company_id = $company_id AND is_delete = 0 AND status = 1 AND audit_status = 1 ORDER BY deploy_time DESC LIMIT 100",
     "message": "查询公司当前在招职位"
 }
 
@@ -86,7 +92,7 @@ Few-Shot 示例（company_id 均用 $company_id）
 输出:
 {
     "count_sql": "SELECT COUNT(*) AS total FROM job WHERE company_id = $company_id AND is_delete = 0 AND work_city LIKE '%深圳%' AND job_type = 0",
-    "list_sql": "SELECT id, name, company_name, company_logo, salary, salary_min, salary_max, job_exp, education, job_type, job_duty, work_city, contact_name, contact_phone, welfare, status, audit_status FROM job WHERE company_id = $company_id AND is_delete = 0 AND work_city LIKE '%深圳%' AND job_type = 0 ORDER BY deploy_time DESC LIMIT 50",
+    "list_sql": "SELECT id, name, company_name, company_logo, salary, salary_min, salary_max, job_exp, education, job_type, job_duty, work_city, contact_name, contact_phone, welfare, status, audit_status FROM job WHERE company_id = $company_id AND is_delete = 0 AND work_city LIKE '%深圳%' AND job_type = 0 ORDER BY deploy_time DESC LIMIT 100",
     "message": "查询公司在深圳发布的全职职位"
 }
 
@@ -95,7 +101,7 @@ Few-Shot 示例（company_id 均用 $company_id）
 输出:
 {
     "count_sql": "SELECT COUNT(*) AS total FROM job WHERE company_id = $company_id AND is_delete = 0",
-    "list_sql": "SELECT id, name, company_name, company_logo, salary, salary_min, salary_max, job_exp, education, job_type, job_duty, work_city, contact_name, contact_phone, welfare, status, audit_status FROM job WHERE company_id = $company_id AND is_delete = 0 ORDER BY deploy_time DESC LIMIT 50",
+    "list_sql": "SELECT id, name, company_name, company_logo, salary, salary_min, salary_max, job_exp, education, job_type, job_duty, work_city, contact_name, contact_phone, welfare, status, audit_status FROM job WHERE company_id = $company_id AND is_delete = 0 ORDER BY deploy_time DESC LIMIT 100",
     "message": "查询公司全部职位"
 }
 
@@ -104,7 +110,7 @@ Few-Shot 示例（company_id 均用 $company_id）
 输出:
 {
     "count_sql": "SELECT COUNT(*) AS total FROM job WHERE company_id = $company_id AND is_delete = 0 AND status = 3",
-    "list_sql": "SELECT id, name, company_name, company_logo, salary, salary_min, salary_max, job_exp, education, job_type, job_duty, work_city, contact_name, contact_phone, welfare, status, audit_status FROM job WHERE company_id = $company_id AND is_delete = 0 AND status = 3 ORDER BY deploy_time DESC LIMIT 50",
+    "list_sql": "SELECT id, name, company_name, company_logo, salary, salary_min, salary_max, job_exp, education, job_type, job_duty, work_city, contact_name, contact_phone, welfare, status, audit_status FROM job WHERE company_id = $company_id AND is_delete = 0 AND status = 3 ORDER BY deploy_time DESC LIMIT 100",
     "message": "查询公司已停止发布的职位"
 }
 ═══════════════════════════════════════════════""")
@@ -123,10 +129,8 @@ def _llm_call(llm: ChatOpenAI, system: str, user_content: str,
     history  = history or []
     messages = [SystemMessage(content=system)]
     for turn in history:
-        if turn["role"] == "user":
-            messages.append(HumanMessage(content=turn["content"]))
-        else:
-            messages.append(AIMessage(content=turn["content"]))
+        cls = HumanMessage if turn["role"] == "user" else AIMessage
+        messages.append(cls(content=turn["content"]))
     messages.append(HumanMessage(content=user_content))
     return (llm | StrOutputParser()).invoke(messages).strip()
 
@@ -144,18 +148,34 @@ def _parse_json_safe(text: str) -> Optional[dict]:
         return None
 
 
-def _validate_company_id_in_sql(sql: str, company_id: int) -> bool:
+def _validate_company_id(sql: str, company_id: int) -> bool:
     """
     第三道防线：验证 LLM 生成的 SQL 确实包含 company_id 过滤。
     LLM 偶尔可能忽略约束，此处做兜底校验。
     """
-    pattern = re.compile(rf"company_id\s*=\s*{company_id}", re.IGNORECASE)
-    return bool(pattern.search(sql))
+    return bool(re.compile(rf"company_id\s*=\s*{company_id}", re.IGNORECASE).search(sql))
 
 
 def _error_response(message: str) -> dict:
     return {"intent": "job_manage", "data": {"message": message}, "status": "error"}
 
+
+def _build_response(page_data, total_db, message):
+    return {
+        "intent": "job_manage",
+        "data": {
+            "message": message,
+            "jobs":    page_data["items"],
+            "pagination": {
+                "page":        page_data["page"],
+                "page_size":   page_data["page_size"],
+                "total_pages": page_data["total_pages"],
+                "fetched":     page_data["fetched"],
+                "total_db":    total_db,
+            },
+        },
+        "status": "success",
+    }
 
 # ─────────────────────────────────────────────
 # 对外接口
@@ -163,9 +183,11 @@ def _error_response(message: str) -> dict:
 
 def handle(
     query:      str,
+    session_id: str,
     company_id: int,
     history:    Optional[list[dict]] = None,
-    llm:        Optional[ChatOpenAI] = None,
+    llm = None,
+    page_size:  int = DEFAULT_PAGE_SIZE,
 ) -> dict:
     """
     招聘者职位管理 Agent 主入口。
@@ -195,33 +217,46 @@ def handle(
 
     count_sql = parsed["count_sql"]
     list_sql  = parsed["list_sql"]
-    message   = parsed.get("message", "查询公司职位")
+    llm_msg   = parsed.get("message", "查询公司职位")
 
     # 第三道防线：SQL 安全校验
     for sql_name, sql in [("count_sql", count_sql), ("list_sql", list_sql)]:
-        if not _validate_company_id_in_sql(sql, company_id):
-            logger.error(
-                f"[job_manage_agent] 安全校验失败：{sql_name} 缺少 company_id={company_id} "
-                f"| SQL: {sql[:100]}"
-            )
+        if not _validate_company_id(sql, company_id):
+            logger.error(f"[job_manage_agent] 安全校验失败：{sql_name} 缺少 company_id={company_id}")
             return _error_response("查询生成异常，请重试或联系管理员")
 
-    logger.info(f"[job_manage_agent] count_sql: {count_sql}")
-    logger.info(f"[job_manage_agent] list_sql:  {list_sql}")
+    repo     = JobRepo()
+    total_db = repo.execute_count_query(count_sql)
+    jobs     = repo.execute_job_query(list_sql)
 
-    repo  = JobRepo()
-    total = repo.execute_count_query(count_sql)
-    jobs  = repo.execute_job_query(list_sql)
+    if total_db < 0:
+        total_db = len(jobs)
 
-    if total < 0:
-        total = len(jobs)
+    if not jobs:
+        return {
+            "intent": "job_manage",
+            "data": {
+                "message": f"{llm_msg}，暂无符合条件的职位",
+                "jobs":    [],
+                "pagination": {
+                    "page": 1, "page_size": page_size,
+                    "total_pages": 0, "fetched": 0, "total_db": 0,
+                },
+            },
+            "status": "success",
+        }
 
-    return {
-        "intent": "job_manage",
-        "data": {
-            "total":   total,
-            "jobs":    jobs,
-            "message": f"{message}，共 {total} 个职位",
-        },
-        "status": "success",
-    }
+    save_page_cache(
+        session_id  = session_id,
+        result_type = RESULT_TYPE,
+        items       = jobs,
+        total_db    = total_db,
+        query       = query,
+    )
+
+    page_data = get_page(session_id, RESULT_TYPE, page=1, page_size=page_size)
+    fetched   = len(jobs)
+    hint = f"（数据库共 {total_db} 个，已为您加载前 {fetched} 个）" if total_db > fetched else ""
+    message = f"{llm_msg}，共 {fetched} 个职位{hint}"
+
+    return _build_response(page_data, total_db, message)
