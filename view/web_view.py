@@ -6,6 +6,11 @@ view/web_view.py — FastAPI Web 层
     POST /api/file/upload       简历文件上传解析
     GET  /api/jobs/page         职位/候选人翻页（从 session 缓存切片，不重查 DB）
     GET  /api/stats             路由命中率统计
+
+v2 变更：
+    - ChatRequest 新增可选字段 tenant_id（admin 登录时由前端传入，后端鉴权时自动覆盖）
+    - /api/chat 透传 user_role 给 ChatController，admin 鉴权逻辑在 Controller 层执行
+    - 收到 auth_failed 响应时，HTTP 状态码仍为 200，由前端根据 intent 字段判断并跳转
 """
 
 import os
@@ -16,6 +21,7 @@ from pathlib import Path
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from typing import Optional
 
 from controller.chat_controller import ChatController
 from controller import session_manager
@@ -59,10 +65,12 @@ app.add_middleware(
 
 class ChatRequest(BaseModel):
     user_id:    int = 161102110337
-    user_role:  str                  # recruiter | jobseeker
+    user_role:  str                  # recruiter | jobseeker | admin
     session_id: str = "3a7b9f2c-8d4e-4a1b-9c6d-7e8f2a1b3c4d"  # 前端生成的 UUID，用于关联历史会话
     message:    str
     page_size:  int = 20             # 首次查询时的每页条数
+    # admin 登录时前端可传入，实际 tenant_id 以后端鉴权结果为准，此字段仅供前端参考
+    tenant_id:  Optional[int] = None
 
 
 # ─────────────────────────────────────────────
@@ -77,7 +85,8 @@ async def chat(request: ChatRequest) -> dict:
     其余意图：返回文本 message，无 pagination 字段。\n
     recruiter 招聘者\n
     jobseeker 求职者\n
-    session_id 对话id
+    admin     user_id=88926257 平台管理员（需在后端完成 tenant_id 鉴权）\n
+    session_id 对话id\n
     """
     controller = ChatController(
         user_role  = request.user_role,
@@ -105,6 +114,9 @@ async def jobs_page(
     result_type 说明：
         "jobs"       对应 job_search / job_manage 的职位列表
         "candidates" 对应 candidate_search 的候选人列表
+
+    注意：count-only 查询（pagination 为 null）不写缓存，
+    前端无需调用此接口，直接展示 message 中的总数即可。
     """
     if result_type not in ("jobs", "candidates"):
         raise HTTPException(status_code=400, detail="result_type 只能是 jobs 或 candidates")

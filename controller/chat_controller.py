@@ -11,11 +11,21 @@ controller/chat_controller.py — 对话控制器（重构版）
 权限控制三道防线：
     第一道：LLM 路由层（supervisor.py）— 感知角色，减少越权意图生成概率
     第二道：控制器层（本文件）— 白名单硬校验，意图不在白名单直接返回 permission_denied
-    第三道：Agent 层 — job_manage/candidate_search 的 SQL 强制携带 company_id
+    第三道：Agent 层 — job_manage/candidate_search 的 SQL 强制携带 company_id 或 tenant_id
+
 主要改进：
     1. 使用 Supervisor.get_instance() 获取单例，不再每次请求新建
     2. route() 调用时传入上一轮 intent/query，支持上下文感知路由
     3. session 中记录 last_intent/last_query，供下次请求读取
+
+v2 变更：
+    - 新增 admin 角色，白名单加入 platform_stats
+    - __init__() 阶段对 admin 角色执行 tenant_id 鉴权
+    - 新增 _get_tenant_id()，根据 user_id 查询 platform 类型企业取 tenant_id
+    - _call_job_manage() / _call_candidate_search() 新增 admin 分支，注入 tenant_id
+    - 新增 _call_job_manage_admin() / _call_candidate_search_admin()
+    - 新增 _call_platform_stats()，调用 platform_stats_agent
+    - _PERMISSION_DENIED_MESSAGES 新增 admin 相关条目
 """
 
 import logging
@@ -30,6 +40,7 @@ from rag_modules.agents import (
     knowledge_agent,
     chitchat_agent,
     unknown_agent,
+    platform_stats_agent,
 )
 from controller import session_manager
 
@@ -37,7 +48,7 @@ logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────
-# 权限控制常量（不变）
+# 权限控制常量（完整版，含 admin）
 # ─────────────────────────────────────────────
 
 _ROLE_INTENT_WHITELIST: dict[str, set[str]] = {
@@ -46,6 +57,10 @@ _ROLE_INTENT_WHITELIST: dict[str, set[str]] = {
     },
     "recruiter": {
         "resume_parse", "job_manage", "candidate_search", "knowledge", "chitchat", "unknown",
+    },
+    "admin": {
+        "resume_parse", "job_manage", "candidate_search", "platform_stats",
+        "knowledge", "chitchat", "unknown",
     },
 }
 
@@ -65,6 +80,14 @@ _PERMISSION_DENIED_MESSAGES: dict = {
         "如需查看公司职位，请说'查看我们公司的职位'；"
         "如需查看候选人，请告诉我职位名称。"
     ),
+    # admin 触发了求职者专属功能
+    ("admin", "job_search"): (
+        "您当前以平台管理员身份登录，不提供求职功能。"
+        "如需查看平台职位数据，可以问我：\n"
+        '· \u201c平台现在有多少个在招职位\u201d\n'
+        '· \u201c深圳地区职位分布情况\u201d\n'
+        '· \u201c查看租户下所有公司的职位列表\u201d'
+    ),
     # 通用兜底
     "default": "抱歉，您当前身份无权使用该功能，请确认操作是否正确。",
 }
@@ -78,6 +101,7 @@ class ChatController:
         - self.supervisor 通过 Supervisor.get_instance() 获取，进程内共享
         - process_message() 读取并传递 prev_intent/prev_query，实现上下文路由
         - process_message() 路由完成后将本轮 intent/query 写回 session
+        - admin 角色在 __init__() 阶段完成 tenant_id 鉴权
     """
 
     def __init__(
@@ -98,6 +122,13 @@ class ChatController:
         self.session_id = session_id
         self._pending_file_path = None
 
+        # admin 鉴权：在初始化阶段就检查 tenant_id，失败时标记鉴权失败
+        # 鉴权结果缓存在 _auth_failed 和 _cached_tenant_id 中
+        self._auth_failed:       bool          = False
+        self._cached_tenant_id:  Optional[int] = None
+        if self.user_role == "admin":
+            self._init_admin_auth()
+
         # ── 获取单例 Supervisor（不重复初始化 LLM）──
         self.supervisor = Supervisor.get_instance(
             rule_confidence_threshold = 1,
@@ -109,10 +140,52 @@ class ChatController:
             "job_search":       self._call_job_search,
             "job_manage":       self._call_job_manage,
             "candidate_search": self._call_candidate_search,
+            "platform_stats":   self._call_platform_stats,
             "knowledge":        self._call_knowledge,
             "chitchat":         self._call_chitchat,
             "unknown":          self._call_unknown,
         }
+
+    # ==================== admin 鉴权 ====================
+
+    def _init_admin_auth(self) -> None:
+        """
+        admin 鉴权链路：
+            user_id → 查询 company 表
+                WHERE user_id=? AND company_type='platform' AND apply_status=1 AND is_delete=0
+                → 取到记录 → 提取 tenant_id → 存入 self._cached_tenant_id
+                → 未取到记录 → 设置 self._auth_failed = True
+        """
+        try:
+            from db.mysql_client import MySQLClient
+            db = MySQLClient.get_instance()
+            with db._session() as session:
+                from sqlalchemy import text
+                row = session.execute(
+                    text(
+                        "SELECT tenant_id FROM company "
+                        "WHERE user_id = :uid AND company_type = 'platform' "
+                        "AND apply_status = 1 AND is_delete = 0 LIMIT 1"
+                    ),
+                    {"uid": self.user_id},
+                ).fetchone()
+
+            if row and row[0] is not None:
+                self._cached_tenant_id = int(row[0])
+                logger.info(f"[admin鉴权] user_id={self.user_id} 关联 tenant_id={self._cached_tenant_id}")
+            else:
+                self._auth_failed = True
+                logger.warning(f"[admin鉴权] user_id={self.user_id} 未找到 platform 类型企业，鉴权失败")
+        except Exception as e:
+            self._auth_failed = True
+            logger.error(f"[admin鉴权] 数据库查询异常: {e}")
+
+    def _get_tenant_id(self) -> Optional[int]:
+        """
+        返回 admin 的 tenant_id（已在 __init__ 阶段缓存）。
+        非 admin 角色返回 None。
+        """
+        return self._cached_tenant_id
 
     # ==================== 历史读写 ====================
 
@@ -150,13 +223,30 @@ class ChatController:
         """
         处理纯文本对话，返回统一响应字典。
         包含完整的两级路由 + 权限校验流程。
+
         Args:
             user_input: 用户原始输入
 
         Returns:
             {"intent": "...", "data": {"message": "..."}, "status": "success"/"error"}
-        新增：读取上一轮路由信息并传入 supervisor.route()，解决指代/省略句问题。
+
+        新增：
+        - admin 鉴权失败时在入口直接拦截，不进入路由流程
+        - 读取上一轮路由信息并传入 supervisor.route()，解决指代/省略句问题
         """
+        # admin 鉴权失败时直接拦截
+        if self.user_role == "admin" and self._auth_failed:
+            return {
+                "intent": "auth_failed",
+                "data": {
+                    "message": (
+                        "您的账号未关联平台企业，无法以管理员身份登录，"
+                        "请联系系统管理员。"
+                    )
+                },
+                "status": "error",
+            }
+
         try:
             # 读取上下文
             prev_intent, prev_query = self._get_last_route()
@@ -317,7 +407,15 @@ class ChatController:
         return response
 
     def _call_job_manage(self, query: str) -> dict:
-        """招聘者查看自己公司职位，强制注入 company_id。"""
+        """
+        职位管理分发：
+            recruiter → 注入 company_id（只能查本公司）
+            admin     → 注入 tenant_id（可查租户下所有公司）
+        """
+        if self.user_role == "admin":
+            return self._call_job_manage_admin(query)
+
+        # recruiter 原有逻辑
         company_id = self._get_company_id()
         if company_id is None:
             return {
@@ -336,8 +434,37 @@ class ChatController:
         self._append_history("job_manage", query, response["data"]["message"])
         return response
 
+    def _call_job_manage_admin(self, query: str) -> dict:
+        """admin 版职位管理：注入 tenant_id，不限 company_id"""
+        tenant_id = self._get_tenant_id()
+        if tenant_id is None:
+            return {
+                "intent": "job_manage",
+                "data":   {"message": "管理员账号 tenant_id 获取失败，请联系系统管理员。"},
+                "status": "error",
+            }
+        history  = self._get_history("job_manage")
+        response = job_manage_agent.handle(
+            query      = query,
+            session_id = self.session_id,
+            company_id = None,
+            tenant_id  = tenant_id,
+            history    = history,
+            llm        = self.supervisor.llm,
+        )
+        self._append_history("job_manage", query, response["data"]["message"])
+        return response
+
     def _call_candidate_search(self, query: str) -> dict:
-        """招聘者查候选人，强制注入 company_id。"""
+        """
+        候选人查询分发：
+            recruiter → 注入 company_id（只能查本公司候选人）
+            admin     → 注入 tenant_id（可查租户下所有候选人）
+        """
+        if self.user_role == "admin":
+            return self._call_candidate_search_admin(query)
+
+        # recruiter 原有逻辑
         company_id = self._get_company_id()
         if company_id is None:
             return {
@@ -354,6 +481,46 @@ class ChatController:
             llm        = self.supervisor.llm,
         )
         self._append_history("candidate_search", query, response["data"]["message"])
+        return response
+
+    def _call_candidate_search_admin(self, query: str) -> dict:
+        """admin 版候选人查询：注入 tenant_id，不限 company_id"""
+        tenant_id = self._get_tenant_id()
+        if tenant_id is None:
+            return {
+                "intent": "candidate_search",
+                "data":   {"message": "管理员账号 tenant_id 获取失败，请联系系统管理员。"},
+                "status": "error",
+            }
+        history  = self._get_history("candidate_search")
+        response = candidate_search_agent.handle(
+            query      = query,
+            session_id = self.session_id,
+            company_id = None,
+            tenant_id  = tenant_id,
+            history    = history,
+            llm        = self.supervisor.llm,
+        )
+        self._append_history("candidate_search", query, response["data"]["message"])
+        return response
+
+    def _call_platform_stats(self, query: str) -> dict:
+        """
+        平台统计（admin 专属）。
+        调用 platform_stats_agent，传入 tenant_id。
+        """
+        tenant_id = self._get_tenant_id()
+        if tenant_id is None:
+            return {
+                "intent": "platform_stats",
+                "data":   {"message": "管理员账号 tenant_id 获取失败，请联系系统管理员。"},
+                "status": "error",
+            }
+        response = platform_stats_agent.handle(
+            query     = query,
+            tenant_id = tenant_id,
+            llm       = self.supervisor.llm,
+        )
         return response
 
     def _call_unknown(self, query: str) -> dict:

@@ -7,8 +7,9 @@ rule_router.py — 基于关键词/正则的规则快速路由层
     3. job_search                — 求职者搜索公开职位（原 job_match 求职侧）
     4. job_manage                — 招聘者管理自己公司职位（新增）
     5. candidate_search          — 招聘者查询候选人（原 job_match 招聘侧）
-    6. knowledge                 — 招聘知识/流程/法规类
-    7. chitchat                  — 闲聊/问候类
+    6. platform_stats            — 平台管理员统计查询（新增）
+    7. knowledge                 — 招聘知识/流程/法规类
+    8. chitchat                  — 闲聊/问候类
     返回 None 表示规则未命中，交由 LLM 处理。
 
 注意：规则层不感知 user_role，角色权限校验由控制器层统一处理。
@@ -137,6 +138,23 @@ _CANDIDATE_SEARCH_PATTERNS: list[re.Pattern] = [
     re.compile(r"(岗位|职位).{0,10}(要求|条件|经验|学历).{0,10}(推荐|匹配|有没有)"),
 ]
 
+# ── platform_stats（平台管理员统计查询）───────
+_PLATFORM_STATS_KEYWORDS: list[str] = [
+    "平台", "租户", "所有企业", "所有公司", "全平台",
+    "企业总数", "公司总数", "职位总数", "岗位总数", "报名总数",
+    "统计", "数据概览", "分布情况", "待审核企业", "待审核职位",
+    "各城市", "各行业", "新增企业", "新增职位",
+]
+
+_PLATFORM_STATS_PATTERNS: list[re.Pattern] = [
+    re.compile(r"(平台|租户).{0,10}(有多少|总数|统计|概览)"),
+    re.compile(r"(有多少家|多少个).{0,6}(企业|公司|职位|岗位)"),
+    re.compile(r"(企业|公司|职位|报名).{0,6}(分布|统计|总数|数量)"),
+    re.compile(r"(各城市|各行业|按城市|按行业).{0,10}(职位|企业|统计)"),
+    re.compile(r"(待审核|未审核).{0,6}(企业|职位|候选人)"),
+    re.compile(r"(今天|本周|本月|最近).{0,10}(新增|注册|发布|报名)"),
+]
+
 # ── knowledge ─────────────────────────────────
 _KNOWLEDGE_KEYWORDS: list[str] = [
     "注意事项", "技巧", "方法", "流程", "步骤",
@@ -204,6 +222,12 @@ _EXACT_MAP: dict[str, Intent] = {
     "找候选人":     "candidate_search",
     "筛选简历":     "candidate_search",
     "招聘匹配":     "candidate_search",
+    # platform_stats
+    "企业总数":     "platform_stats",
+    "职位总数":     "platform_stats",
+    "平台统计":     "platform_stats",
+    "报名总数":     "platform_stats",
+    "数据概览":     "platform_stats",
     # chitchat
     "你好":   "chitchat",
     "hi":     "chitchat",
@@ -272,11 +296,14 @@ class RuleRouter:
                 return "candidate_search"
 
         # 3. 按意图顺序打分
+        # 打分顺序：resume_parse → candidate_search → job_search → job_manage
+        #           → platform_stats → knowledge → chitchat
         for intent_label, kw_list, pat_list in [
             ("resume_parse",     _RESUME_KEYWORDS,           _RESUME_PATTERNS),
             ("candidate_search", _CANDIDATE_SEARCH_KEYWORDS, _CANDIDATE_SEARCH_PATTERNS),  # 提前，避免"招人"类被 job_search 抢走
             ("job_search",       _JOB_SEARCH_KEYWORDS,       _JOB_SEARCH_PATTERNS),
             ("job_manage",       _JOB_MANAGE_KEYWORDS,       _JOB_MANAGE_PATTERNS),
+            ("platform_stats",   _PLATFORM_STATS_KEYWORDS,   _PLATFORM_STATS_PATTERNS),    # 新增
             ("knowledge",        _KNOWLEDGE_KEYWORDS,        _KNOWLEDGE_PATTERNS),
             ("chitchat",         _CHITCHAT_KEYWORDS,         _CHITCHAT_PATTERNS),
         ]:
@@ -298,6 +325,7 @@ class RuleRouter:
             ("candidate_search", _CANDIDATE_SEARCH_KEYWORDS, _CANDIDATE_SEARCH_PATTERNS),
             ("job_search",       _JOB_SEARCH_KEYWORDS,       _JOB_SEARCH_PATTERNS),
             ("job_manage",       _JOB_MANAGE_KEYWORDS,       _JOB_MANAGE_PATTERNS),
+            ("platform_stats",   _PLATFORM_STATS_KEYWORDS,   _PLATFORM_STATS_PATTERNS),
             ("knowledge",        _KNOWLEDGE_KEYWORDS,        _KNOWLEDGE_PATTERNS),
             ("chitchat",         _CHITCHAT_KEYWORDS,         _CHITCHAT_PATTERNS),
         ]:

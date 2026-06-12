@@ -20,6 +20,10 @@ API 响应格式：
     - SQL 固定 LIMIT 100（MAX_FETCH），不再由 LLM 决定
     - handle() 返回第 1 页切片 + 分页元信息，同时将全量数据写入 session 缓存
     - 新增 result_type = "jobs"，供翻页接口识别缓存类型
+
+v2 变更：
+    - 新增 _is_count_only() 检测：用户只需要总数时跳过 list_sql，节省 DB IO
+    - count-only 响应中 pagination 字段为 None，前端不渲染翻页组件
 """
 
 import json
@@ -122,6 +126,30 @@ _NO_RESULT_SYSTEM = """你是一个友好的招聘助手。
 
 
 # ─────────────────────────────────────────────
+# count-only 模式（只查总数，跳过 list_sql）
+# ─────────────────────────────────────────────
+
+_COUNT_ONLY_KEYWORDS: list[str] = [
+    "有多少", "总数", "数量", "几个", "几家", "几条",
+    "多少人", "多少个", "多少条", "统计一下", "共有多少",
+]
+
+_LIST_SIGNALS: list[str] = [
+    "列出", "列表", "展示", "显示", "看看", "有哪些", "详情",
+]
+
+
+def _is_count_only(query: str) -> bool:
+    """
+    判断用户是否只需要总数。
+    排除同时含有列表类词语的情况（如"有多少职位，列出来"）。
+    """
+    has_count = any(kw in query for kw in _COUNT_ONLY_KEYWORDS)
+    has_list  = any(kw in query for kw in _LIST_SIGNALS)
+    return has_count and not has_list
+
+
+# ─────────────────────────────────────────────
 # 工具函数
 # ─────────────────────────────────────────────
 
@@ -218,8 +246,25 @@ def handle(
     logger.info(f"[job_search_agent] list_sql:  {list_sql}")
 
     repo     = JobRepo()
-    total_db = repo.execute_count_query(count_sql)
-    jobs     = repo.execute_job_query(list_sql)     # SQL 已含 LIMIT 100
+
+    # count-only 模式：只查总数，跳过 list_sql，节省 DB IO
+    count_only = _is_count_only(query)
+    total_db   = repo.execute_count_query(count_sql)
+
+    if count_only:
+        if total_db < 0:
+            total_db = 0
+        return {
+            "intent": "job_search",
+            "data": {
+                "message":    f"{llm_msg}，共找到 {total_db} 个职位",
+                "jobs":       [],
+                "pagination": None,   # 无分页数据，前端不渲染翻页组件
+            },
+            "status": "success",
+        }
+
+    jobs = repo.execute_job_query(list_sql)     # SQL 已含 LIMIT 100
 
     if total_db < 0:
         total_db = len(jobs)

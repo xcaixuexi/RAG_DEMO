@@ -2,8 +2,8 @@
 job_manage_agent.py — 招聘者职位管理 Agent（分页版）
 
 职责：帮助招聘者查看/管理自己公司发布的职位。
-仅服务招聘者（recruiter），且 SQL 强制注入 company_id 过滤，
-确保数据隔离（即便控制器层被绕过，也只能查到本公司数据）。
+recruiter 路径：SQL 强制注入 company_id，确保数据隔离（只能查本公司数据）。
+admin 路径：SQL 注入 tenant_id，可查该租户下所有公司的职位数据。
 
 API 响应格式：
     {
@@ -17,6 +17,12 @@ API 响应格式：
     }
 改进：SQL 生成 Prompt 增加 3 个 Few-Shot 示例。
 改动：SQL 固定 LIMIT 100，结果写入 session 缓存，返回第 1 页切片。
+
+v2 变更：
+    - handle() 新增 tenant_id 参数（admin 路径使用）
+    - 新增 _SQL_SYSTEM_ADMIN_TEMPLATE（tenant_id 版 Prompt）
+    - _validate_company_id() 扩展为 _validate_scope_filter()，同时支持 company_id 和 tenant_id
+    - handle() 入口根据参数选择对应 Prompt 模板
 """
 
 import json
@@ -40,10 +46,10 @@ logger = logging.getLogger(__name__)
 RESULT_TYPE = "jobs"
 
 # ─────────────────────────────────────────────
-# Prompt（动态注入 company_id + Few-Shot）
+# Prompt — recruiter 版（注入 company_id）
 # ─────────────────────────────────────────────
 
-_SQL_SYSTEM_TEMPLATE = Template("""你是一个招聘数据库查询助手，正在帮助招聘者查看自己公司发布的职位。
+_SQL_SYSTEM_RECRUITER_TEMPLATE = Template("""你是一个招聘数据库查询助手，正在帮助招聘者查看自己公司发布的职位。
 根据用户的自然语言需求，同时生成两条查询 job 表的 SQL 语句。
 
 表名：job
@@ -117,6 +123,90 @@ Few-Shot 示例（company_id 均用 $company_id）
 
 
 # ─────────────────────────────────────────────
+# Prompt — admin 版（注入 tenant_id）
+# ─────────────────────────────────────────────
+
+_SQL_SYSTEM_ADMIN_TEMPLATE = Template("""你是一个招聘数据库查询助手，正在帮助平台管理员查看该租户下所有公司发布的职位。
+根据用户的自然语言需求，同时生成两条查询 job 表的 SQL 语句。
+
+表名：job
+可用查询字段：
+    name         VARCHAR  职位名称，用 LIKE '%xxx%' 模糊匹配
+    company_name VARCHAR  企业名称，用 LIKE '%xxx%' 模糊匹配
+    status       TINYINT  职位状态：0未审核 1已发布 2不通过 3停止发布
+    job_type     TINYINT  职位类型：0全职 1就业 2实习 3临时工
+    audit_status TINYINT  审核状态：0未审核 1通过 2不通过
+    work_city    VARCHAR  工作城市
+    salary_min   INT      最低薪资
+    salary_max   INT      最高薪资
+    create_time  DATETIME 创建时间
+    deploy_time  DATETIME 发布时间
+
+重要限制（数据隔离）：
+    所有查询必须加上 tenant_id = $tenant_id 条件。
+
+固定规则：
+    1. WHERE 必须包含 tenant_id = $tenant_id AND is_delete = 0
+    2. 查询"在招/发布中"的职位时加 status=1 AND audit_status=1
+    3. 用户未指定状态时默认查询全部未删除职位（不加 status 过滤）
+    4. list_sql 加 LIMIT 100（固定，不可更改）和 ORDER BY deploy_time DESC
+    5. list_sql SELECT 字段固定为：
+       id, name, company_name, company_logo, salary, salary_min, salary_max,
+       job_exp, education, job_type, job_duty, work_city,
+       contact_name, contact_phone, welfare, status, audit_status
+    6. count_sql 固定为：SELECT COUNT(*) AS total FROM job WHERE ...
+
+只输出 JSON，格式：{"count_sql": "...", "list_sql": "...", "message": "..."}
+
+═══════════════════════════════════════════════
+Few-Shot 示例（tenant_id 均用 $tenant_id）
+═══════════════════════════════════════════════
+
+【示例1 — 查询所有在招职位】
+用户输入: 租户下有哪些在招职位
+输出:
+{
+    "count_sql": "SELECT COUNT(*) AS total FROM job WHERE tenant_id = $tenant_id AND is_delete = 0 AND status = 1 AND audit_status = 1",
+    "list_sql": "SELECT id, name, company_name, company_logo, salary, salary_min, salary_max, job_exp, education, job_type, job_duty, work_city, contact_name, contact_phone, welfare, status, audit_status FROM job WHERE tenant_id = $tenant_id AND is_delete = 0 AND status = 1 AND audit_status = 1 ORDER BY deploy_time DESC LIMIT 100",
+    "message": "查询租户下所有在招职位"
+}
+
+【示例2 — 指定企业名称查询】
+用户输入: XX科技公司发布的职位
+输出:
+{
+    "count_sql": "SELECT COUNT(*) AS total FROM job WHERE tenant_id = $tenant_id AND is_delete = 0 AND company_name LIKE '%XX科技%'",
+    "list_sql": "SELECT id, name, company_name, company_logo, salary, salary_min, salary_max, job_exp, education, job_type, job_duty, work_city, contact_name, contact_phone, welfare, status, audit_status FROM job WHERE tenant_id = $tenant_id AND is_delete = 0 AND company_name LIKE '%XX科技%' ORDER BY deploy_time DESC LIMIT 100",
+    "message": "查询XX科技公司发布的职位"
+}
+═══════════════════════════════════════════════""")
+
+
+# ─────────────────────────────────────────────
+# count-only 模式（只查总数，跳过 list_sql）
+# ─────────────────────────────────────────────
+
+_COUNT_ONLY_KEYWORDS: list[str] = [
+    "有多少", "总数", "数量", "几个", "几家", "几条",
+    "多少人", "多少个", "多少条", "统计一下", "共有多少",
+]
+
+_LIST_SIGNALS: list[str] = [
+    "列出", "列表", "展示", "显示", "看看", "有哪些", "详情",
+]
+
+
+def _is_count_only(query: str) -> bool:
+    """
+    判断用户是否只需要总数。
+    排除同时含有列表类词语的情况（如"有多少职位，列出来"）。
+    """
+    has_count = any(kw in query for kw in _COUNT_ONLY_KEYWORDS)
+    has_list  = any(kw in query for kw in _LIST_SIGNALS)
+    return has_count and not has_list
+
+
+# ─────────────────────────────────────────────
 # 工具函数
 # ─────────────────────────────────────────────
 
@@ -148,12 +238,21 @@ def _parse_json_safe(text: str) -> Optional[dict]:
         return None
 
 
-def _validate_company_id(sql: str, company_id: int) -> bool:
+def _validate_scope_filter(sql: str, company_id: Optional[int], tenant_id: Optional[int]) -> bool:
     """
-    第三道防线：验证 LLM 生成的 SQL 确实包含 company_id 过滤。
-    LLM 偶尔可能忽略约束，此处做兜底校验。
+    第三道防线：校验 SQL 包含对应的范围过滤条件。
+    recruiter 模式校验 company_id，admin 模式校验 tenant_id。
+    扩展自原 _validate_company_id()，同时支持两种过滤方式。
     """
-    return bool(re.compile(rf"company_id\s*=\s*{company_id}", re.IGNORECASE).search(sql))
+    if company_id is not None:
+        return bool(
+            re.compile(rf"company_id\s*=\s*{company_id}", re.IGNORECASE).search(sql)
+        )
+    if tenant_id is not None:
+        return bool(
+            re.compile(rf"(j\.|c\.)?tenant_id\s*=\s*{tenant_id}", re.IGNORECASE).search(sql)
+        )
+    return False
 
 
 def _error_response(message: str) -> dict:
@@ -184,7 +283,8 @@ def _build_response(page_data, total_db, message):
 def handle(
     query:      str,
     session_id: str,
-    company_id: int,
+    company_id: Optional[int] = None,
+    tenant_id:  Optional[int] = None,
     history:    Optional[list[dict]] = None,
     llm = None,
     page_size:  int = DEFAULT_PAGE_SIZE,
@@ -194,7 +294,9 @@ def handle(
 
     Args:
         query:      用户输入
-        company_id: 当前招聘者关联的企业 ID（由控制器层强制注入，不可为 None）
+        company_id: 招聘者关联的企业 ID（recruiter 路径，由控制器层强制注入）
+        tenant_id:  租户 ID（admin 路径，由控制器层强制注入）
+                    company_id 和 tenant_id 必须有且仅有一个不为 None
         history:    多轮对话历史（最多 5 轮）
         llm:        ChatOpenAI 实例
 
@@ -207,7 +309,16 @@ def handle(
         logger.error("[job_manage_agent] llm 未传入")
         return _error_response("系统配置错误，请联系管理员")
 
-    system = _SQL_SYSTEM_TEMPLATE.substitute(company_id=company_id)
+    if company_id is None and tenant_id is None:
+        logger.error("[job_manage_agent] company_id 和 tenant_id 均为 None，缺少范围过滤参数")
+        return _error_response("缺少必要的权限参数，请联系管理员")
+
+    # 根据参数选择对应模板
+    if company_id is not None:
+        system = _SQL_SYSTEM_RECRUITER_TEMPLATE.substitute(company_id=company_id)
+    else:
+        system = _SQL_SYSTEM_ADMIN_TEMPLATE.substitute(tenant_id=tenant_id)
+
     raw    = _llm_call(llm, system, query, history)
     parsed = _parse_json_safe(raw)
 
@@ -221,13 +332,33 @@ def handle(
 
     # 第三道防线：SQL 安全校验
     for sql_name, sql in [("count_sql", count_sql), ("list_sql", list_sql)]:
-        if not _validate_company_id(sql, company_id):
-            logger.error(f"[job_manage_agent] 安全校验失败：{sql_name} 缺少 company_id={company_id}")
+        if not _validate_scope_filter(sql, company_id, tenant_id):
+            logger.error(
+                f"[job_manage_agent] 安全校验失败：{sql_name} "
+                f"缺少 company_id={company_id} 或 tenant_id={tenant_id}"
+            )
             return _error_response("查询生成异常，请重试或联系管理员")
 
     repo     = JobRepo()
+
+    # count-only 模式：只查总数，跳过 list_sql
+    count_only = _is_count_only(query)
     total_db = repo.execute_count_query(count_sql)
-    jobs     = repo.execute_job_query(list_sql)
+
+    if count_only:
+        if total_db < 0:
+            total_db = 0
+        return {
+            "intent": "job_manage",
+            "data": {
+                "message":    f"{llm_msg}，共 {total_db} 个职位",
+                "jobs":       [],
+                "pagination": None,   # 无分页数据，前端不渲染翻页组件
+            },
+            "status": "success",
+        }
+
+    jobs = repo.execute_job_query(list_sql)
 
     if total_db < 0:
         total_db = len(jobs)

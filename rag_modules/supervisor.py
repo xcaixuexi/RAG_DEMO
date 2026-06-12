@@ -6,6 +6,11 @@ rag_modules/supervisor.py — 路由主管（重构版）
     2. 上下文感知路由：接收上一轮 intent/query，解决指代/省略句误判
     3. 结构化 Prompt：分块编号 + 全局优先规则 + 边界案例示例 + 置信度输出
     4. 委托 LLMFactory：统一模型切换，业务层零感知
+
+v2 变更：
+    - Intent 新增 platform_stats（平台管理员专属统计意图）
+    - LLM Router Prompt 新增第 8 个意图说明
+    - 全局优先规则新增 P5：含跨公司聚合词时优先 platform_stats
 """
 
 import logging
@@ -25,9 +30,10 @@ logger = logging.getLogger(__name__)
 # 意图类型定义
 Intent = Literal[
     "resume_parse",
-    "job_search",       # 求职者搜索平台公开职位
-    "job_manage",       # 招聘者查看/管理自己公司职位
-    "candidate_search", # 招聘者查询候选人和报名情况
+    "job_search",        # 求职者搜索平台公开职位
+    "job_manage",        # 招聘者查看/管理自己公司职位
+    "candidate_search",  # 招聘者查询候选人和报名情况
+    "platform_stats",    # 平台管理员专属统计查询（新增）
     "knowledge",
     "chitchat",
     "unknown",
@@ -35,7 +41,7 @@ Intent = Literal[
 
 _VALID_INTENTS = {
     "resume_parse", "job_search", "job_manage",
-    "candidate_search", "knowledge", "chitchat",
+    "candidate_search", "platform_stats", "knowledge", "chitchat",
 }
 
 
@@ -58,6 +64,7 @@ P2. 含"找工作/找职位/想应聘/投简历/求职" → 优先 job_search（
 P3. 含"简历/cv/履历" + 操作动词 → 优先 resume_parse
 P4. 当前输入 ≤8字 且为省略句/指代（"深圳的呢"/"还有吗"/"那个职位"）
     → 继承上一轮意图（prev_intent），不要输出 unknown
+P5. 含"所有企业/所有公司/全平台/平台统计/租户统计"等跨公司聚合词 → 优先 platform_stats
 
 ═══════════════════════════════════════════════
 【意图详细说明】
@@ -113,6 +120,15 @@ P4. 当前输入 ≤8字 且为省略句/指代（"深圳的呢"/"还有吗"/"�
    ✓ "你叫什么名字"
 
 7. unknown — 真正无法归类时使用（慎用，优先继承上下文）
+
+8. platform_stats — 平台级统计查询（仅 admin 可用）
+   触发词：平台、所有企业、全平台、总数、统计、分布、各城市、各行业、待审核
+   示例：
+   ✓ "现在有多少家企业"
+   ✓ "平台今天新增了多少职位"
+   ✓ "各城市职位分布情况"
+   ✓ "待审核的企业有几家"
+   ✗ "我们公司有多少职位" → job_manage（有"我们公司"，是招聘者视角）
 
 ═══════════════════════════════════════════════
 【上下文继承示例】
