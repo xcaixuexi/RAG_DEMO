@@ -24,10 +24,19 @@ API 响应格式：
 v2 变更：
     - 新增 _is_count_only() 检测：用户只需要总数时跳过 list_sql，节省 DB IO
     - count-only 响应中 pagination 字段为 None，前端不渲染翻页组件
+
+v3 变更：
+    - handle() 新增可选参数 tenant_id（admin 路径使用）
+    - admin 调用时 Prompt 注入 tenant_id 条件，SQL 限定 tenant_id 范围
+    - 新增 _SQL_SYSTEM_ADMIN_TEMPLATE（string.Template，注入 tenant_id）
+    - _validate_tenant_id()：admin 路径下校验 SQL 是否包含 tenant_id 过滤（第三道防线）
+    - jobseeker 路径使用原 _SQL_SYSTEM，不受影响
 """
 
 import json
 import logging
+import re
+from string import Template
 from typing import Optional
 
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
@@ -124,6 +133,69 @@ _NO_RESULT_SYSTEM = """你是一个友好的招聘助手。
 用户搜索职位无结果，请给出简短、友好的建议，引导用户放宽条件重试。
 回复控制在 50 字以内，不用列条目，一段话即可。"""
 
+# ─────────────────────────────────────────────
+# admin 版 Prompt（v3 新增，注入 tenant_id）
+# 使用 string.Template（$tenant_id）避免 JSON 花括号冲突。
+# ─────────────────────────────────────────────
+
+_SQL_SYSTEM_ADMIN_TEMPLATE = Template("""你是一个招聘数据库查询助手，正在帮助平台管理员搜索该租户下的职位。
+根据用户的自然语言需求，同时生成两条查询 job 表的 SQL 语句。
+
+表名：job
+可用查询字段：
+    name         VARCHAR  职位名称，用 LIKE '%xxx%' 模糊匹配
+    company_name VARCHAR  企业名称，用 LIKE '%xxx%' 模糊匹配
+    work_city    VARCHAR  工作城市，用 LIKE '%xxx%' 模糊匹配
+    salary_min   INT      最低薪资（元/月）
+    salary_max   INT      最高薪资（元/月）
+    salary       VARCHAR  薪资范围，值域：面议/3k以下/3k-5k/5k-8k/8k-12k/12k-15k/15k-20k/20k以上
+    job_exp      VARCHAR  工作经验，值域：不限/应届生/3年及以下/3-5年/5-10年/10年以上
+    education    VARCHAR  学历要求，值域：不限/大专/本科/硕士/博士
+    job_type     TINYINT  职位类型：0全职 1就业 2实习 3临时工
+
+重要限制（数据隔离）：
+    所有查询必须加上 tenant_id = $tenant_id 条件。
+
+多条件规则：
+    - 用户提到多个条件时，所有条件用 AND 连接，不要只取其中一个
+    - 职位类型（全职/实习/临时工等）用 job_type 字段匹配，不要用 name LIKE
+
+固定规则：
+    1. WHERE 条件必须包含 tenant_id = $tenant_id AND status=1 AND is_delete=0 AND audit_status=1
+    2. 条件不确定时宁可不加，不要强行猜测
+    3. list_sql 必须加 LIMIT 100（固定值，不可更改）
+    4. list_sql SELECT 字段固定为：
+       id, name, company_name, company_logo, salary, salary_min, salary_max,
+       job_exp, education, job_type, job_duty, work_city,
+       contact_name, contact_phone, welfare
+    5. count_sql 固定为：SELECT COUNT(*) AS total FROM job WHERE ...
+
+只输出 JSON，不输出任何其他文字，格式：
+{"count_sql": "...", "list_sql": "...", "message": "..."}
+
+═══════════════════════════════════════════════
+Few-Shot 示例（tenant_id 均用 $tenant_id）
+═══════════════════════════════════════════════
+
+【示例1 — 单条件：城市】
+用户输入: 深圳有哪些职位
+输出:
+{
+    "count_sql": "SELECT COUNT(*) AS total FROM job WHERE tenant_id=$tenant_id AND status=1 AND is_delete=0 AND audit_status=1 AND work_city LIKE '%深圳%'",
+    "list_sql": "SELECT id, name, company_name, company_logo, salary, salary_min, salary_max, job_exp, education, job_type, job_duty, work_city, contact_name, contact_phone, welfare FROM job WHERE tenant_id=$tenant_id AND status=1 AND is_delete=0 AND audit_status=1 AND work_city LIKE '%深圳%' LIMIT 100",
+    "message": "搜索租户下深圳地区所有职位"
+}
+
+【示例2 — 多条件 AND：城市 + 岗位 + 薪资】
+用户输入: 上海月薪15k以上的产品经理职位
+输出:
+{
+    "count_sql": "SELECT COUNT(*) AS total FROM job WHERE tenant_id=$tenant_id AND status=1 AND is_delete=0 AND audit_status=1 AND work_city LIKE '%上海%' AND name LIKE '%产品经理%' AND salary_min >= 15000",
+    "list_sql": "SELECT id, name, company_name, company_logo, salary, salary_min, salary_max, job_exp, education, job_type, job_duty, work_city, contact_name, contact_phone, welfare FROM job WHERE tenant_id=$tenant_id AND status=1 AND is_delete=0 AND audit_status=1 AND work_city LIKE '%上海%' AND name LIKE '%产品经理%' AND salary_min >= 15000 LIMIT 100",
+    "message": "搜索租户下上海月薪15k以上的产品经理职位"
+}
+═══════════════════════════════════════════════""")
+
 
 # ─────────────────────────────────────────────
 # count-only 模式（只查总数，跳过 list_sql）
@@ -181,6 +253,16 @@ def _parse_json_safe(text: str) -> Optional[dict]:
         return None
 
 
+def _validate_tenant_id(sql: str, tenant_id: int) -> bool:
+    """
+    第三道防线（admin 路径专用）：
+    校验 LLM 生成的 SQL 是否包含 tenant_id 过滤，防止数据越权。
+    """
+    return bool(
+        re.compile(rf"tenant_id\s*=\s*{tenant_id}", re.IGNORECASE).search(sql)
+    )
+
+
 def _error_response(message: str) -> dict:
     return {"intent": "job_search", "data": {"message": message}, "status": "error"}
 
@@ -214,6 +296,7 @@ def handle(
     history:    Optional[list[dict]] = None,
     llm = None,
     page_size:  int = DEFAULT_PAGE_SIZE,
+    tenant_id:  Optional[int] = None,
 ) -> dict:
     """
     首次查询入口：LLM 生成 SQL → 查 DB → 缓存全量 → 返回第 1 页。
@@ -224,6 +307,8 @@ def handle(
         history:    多轮对话历史
         llm:        ChatOpenAI 实例
         page_size:  每页条数，默认 20
+        tenant_id:  租户 ID（admin 路径由控制器层注入，jobseeker 路径为 None）
+                    不为 None 时使用 admin Prompt，SQL 强制包含 tenant_id 过滤条件
     """
     history = history or []
 
@@ -231,7 +316,13 @@ def handle(
         logger.error("[job_search_agent] llm 未传入")
         return _error_response("系统配置错误，请联系管理员")
 
-    raw    = _llm_call(llm, _SQL_SYSTEM, query, history)
+    # admin 路径：使用注入了 tenant_id 的 Prompt；jobseeker 路径使用原 Prompt
+    if tenant_id is not None:
+        system = _SQL_SYSTEM_ADMIN_TEMPLATE.substitute(tenant_id=tenant_id)
+    else:
+        system = _SQL_SYSTEM
+
+    raw    = _llm_call(llm, system, query, history)
     parsed = _parse_json_safe(raw)
 
     if parsed is None or "count_sql" not in parsed or "list_sql" not in parsed:
@@ -245,7 +336,17 @@ def handle(
     logger.info(f"[job_search_agent] count_sql: {count_sql}")
     logger.info(f"[job_search_agent] list_sql:  {list_sql}")
 
-    repo     = JobRepo()
+    # 第三道防线（admin 路径）：校验 SQL 是否携带 tenant_id 过滤，防止数据越权
+    if tenant_id is not None:
+        for sql_name, sql in [("count_sql", count_sql), ("list_sql", list_sql)]:
+            if not _validate_tenant_id(sql, tenant_id):
+                logger.error(
+                    f"[job_search_agent] 安全校验失败：{sql_name} "
+                    f"缺少 tenant_id={tenant_id} 过滤"
+                )
+                return _error_response("查询生成异常，请重试或联系管理员")
+
+    repo = JobRepo()
 
     # count-only 模式：只查总数，跳过 list_sql，节省 DB IO
     count_only = _is_count_only(query)

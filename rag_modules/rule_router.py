@@ -4,10 +4,10 @@ rule_router.py — 基于关键词/正则的规则快速路由层
 路由优先级（从高到低）：
     1. 否定保护 (NegationGuard)  — 含"不要/别/取消"等否定词时直接放行给 LLM
     2. resume_parse              — 简历解析类
-    3. job_search                — 求职者搜索公开职位（原 job_match 求职侧）
-    4. job_manage                — 招聘者管理自己公司职位（新增）
-    5. candidate_search          — 招聘者查询候选人（原 job_match 招聘侧）
-    6. platform_stats            — 平台管理员统计查询（新增）
+    3. candidate_search          — 招聘者查询候选人（原 job_match 招聘侧）
+    4. job_search                — 求职者搜索公开职位（原 job_match 求职侧）
+    5. platform_stats            — 平台管理员统计查询（v2 调整：移至 job_manage 前，防止"发布了多少职位"被抢走）
+    6. job_manage                — 招聘者管理自己公司职位
     7. knowledge                 — 招聘知识/流程/法规类
     8. chitchat                  — 闲聊/问候类
     返回 None 表示规则未命中，交由 LLM 处理。
@@ -144,6 +144,9 @@ _PLATFORM_STATS_KEYWORDS: list[str] = [
     "企业总数", "公司总数", "职位总数", "岗位总数", "报名总数",
     "统计", "数据概览", "分布情况", "待审核企业", "待审核职位",
     "各城市", "各行业", "新增企业", "新增职位",
+    # v2 补充：追问 / 泛问句场景（防止被 job_manage 关键词抢走）
+    "发布了多少", "多少个职位", "多少个在招", "发布的职位",
+    "多少家", "共有多少", "一共多少",
 ]
 
 _PLATFORM_STATS_PATTERNS: list[re.Pattern] = [
@@ -296,14 +299,16 @@ class RuleRouter:
                 return "candidate_search"
 
         # 3. 按意图顺序打分
-        # 打分顺序：resume_parse → candidate_search → job_search → job_manage
-        #           → platform_stats → knowledge → chitchat
+        # 打分顺序：resume_parse → candidate_search → job_search
+        #           → platform_stats → job_manage → knowledge → chitchat
+        # v2 调整：platform_stats 移到 job_manage 前，
+        #          防止"发布了多少职位"被 job_manage 的"发布的职位"关键词抢走
         for intent_label, kw_list, pat_list in [
+            ("platform_stats",   _PLATFORM_STATS_KEYWORDS,   _PLATFORM_STATS_PATTERNS),    # v2 调整：移至 job_manage 前
             ("resume_parse",     _RESUME_KEYWORDS,           _RESUME_PATTERNS),
             ("candidate_search", _CANDIDATE_SEARCH_KEYWORDS, _CANDIDATE_SEARCH_PATTERNS),  # 提前，避免"招人"类被 job_search 抢走
             ("job_search",       _JOB_SEARCH_KEYWORDS,       _JOB_SEARCH_PATTERNS),
             ("job_manage",       _JOB_MANAGE_KEYWORDS,       _JOB_MANAGE_PATTERNS),
-            ("platform_stats",   _PLATFORM_STATS_KEYWORDS,   _PLATFORM_STATS_PATTERNS),    # 新增
             ("knowledge",        _KNOWLEDGE_KEYWORDS,        _KNOWLEDGE_PATTERNS),
             ("chitchat",         _CHITCHAT_KEYWORDS,         _CHITCHAT_PATTERNS),
         ]:
@@ -320,12 +325,13 @@ class RuleRouter:
         text = _normalize(query).lower()
         has_negation = _any_keyword(text, _NEGATION_WORDS)
         scores = {}
+        # explain() 的打分顺序与 route() 保持一致
         for label, kw_list, pat_list in [
+            ("platform_stats",   _PLATFORM_STATS_KEYWORDS,   _PLATFORM_STATS_PATTERNS),    # v2 调整：移至 job_manage 前
             ("resume_parse",     _RESUME_KEYWORDS,           _RESUME_PATTERNS),
             ("candidate_search", _CANDIDATE_SEARCH_KEYWORDS, _CANDIDATE_SEARCH_PATTERNS),
             ("job_search",       _JOB_SEARCH_KEYWORDS,       _JOB_SEARCH_PATTERNS),
             ("job_manage",       _JOB_MANAGE_KEYWORDS,       _JOB_MANAGE_PATTERNS),
-            ("platform_stats",   _PLATFORM_STATS_KEYWORDS,   _PLATFORM_STATS_PATTERNS),
             ("knowledge",        _KNOWLEDGE_KEYWORDS,        _KNOWLEDGE_PATTERNS),
             ("chitchat",         _CHITCHAT_KEYWORDS,         _CHITCHAT_PATTERNS),
         ]:

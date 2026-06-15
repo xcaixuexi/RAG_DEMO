@@ -26,6 +26,14 @@ v2 变更：
     - 新增 _call_job_manage_admin() / _call_candidate_search_admin()
     - 新增 _call_platform_stats()，调用 platform_stats_agent
     - _PERMISSION_DENIED_MESSAGES 新增 admin 相关条目
+
+v3 变更：
+    - admin 权限矩阵改为 None（不做意图拦截，所有意图均可访问）
+    - _check_permission() 新方法统一处理权限校验，None 白名单直接放行
+    - process_message() 权限校验改为调用 _check_permission()
+    - _call_job_search() 新增 admin 分支：透传 tenant_id 给 job_search_agent
+    - _call_job_manage() / _call_candidate_search() admin 分支保持不变（已有）
+    - 移除 ("admin", "job_search") 的 permission_denied 条目（admin 现可访问 job_search）
 """
 
 import logging
@@ -51,17 +59,17 @@ logger = logging.getLogger(__name__)
 # 权限控制常量（完整版，含 admin）
 # ─────────────────────────────────────────────
 
-_ROLE_INTENT_WHITELIST: dict[str, set[str]] = {
+# admin 值为 None，表示不做意图拦截——所有意图均可访问。
+# admin 可以调用 job_search/job_manage/candidate_search 时，
+# 控制器层在分发方法内注入 tenant_id 实现数据隔离（见各 _call_* 方法）。
+_ROLE_INTENT_WHITELIST: dict[str, set | None] = {
     "jobseeker": {
         "resume_parse", "job_search", "knowledge", "chitchat", "unknown",
     },
     "recruiter": {
         "resume_parse", "job_manage", "candidate_search", "knowledge", "chitchat", "unknown",
     },
-    "admin": {
-        "resume_parse", "job_manage", "candidate_search", "platform_stats",
-        "knowledge", "chitchat", "unknown",
-    },
+    "admin": None,  # None 表示不做意图拦截，所有意图均可访问（数据隔离由 tenant_id 保证）
 }
 
 _PERMISSION_DENIED_MESSAGES: dict = {
@@ -80,14 +88,8 @@ _PERMISSION_DENIED_MESSAGES: dict = {
         "如需查看公司职位，请说'查看我们公司的职位'；"
         "如需查看候选人，请告诉我职位名称。"
     ),
-    # admin 触发了求职者专属功能
-    ("admin", "job_search"): (
-        "您当前以平台管理员身份登录，不提供求职功能。"
-        "如需查看平台职位数据，可以问我：\n"
-        '· \u201c平台现在有多少个在招职位\u201d\n'
-        '· \u201c深圳地区职位分布情况\u201d\n'
-        '· \u201c查看租户下所有公司的职位列表\u201d'
-    ),
+    # v3 说明：admin 白名单已改为 None（不拦截），("admin", "job_search") 条目已移除。
+    # admin 调用 job_search 时会走 _call_job_search() 的 admin 分支，注入 tenant_id。
     # 通用兜底
     "default": "抱歉，您当前身份无权使用该功能，请确认操作是否正确。",
 }
@@ -145,6 +147,20 @@ class ChatController:
             "chitchat":         self._call_chitchat,
             "unknown":          self._call_unknown,
         }
+
+    # ==================== 权限校验 ====================
+
+    def _check_permission(self, intent: str) -> bool:
+        """
+        校验当前角色是否有权访问指定意图。
+        - whitelist 为 None（admin）→ 直接放行，所有意图均可访问
+        - whitelist 为 set      → intent 必须在集合内
+        v3 新增，替换原 process_message() 中的内联判断逻辑。
+        """
+        whitelist = _ROLE_INTENT_WHITELIST.get(self.user_role)
+        if whitelist is None:
+            return True     # admin：不做意图拦截
+        return intent in whitelist
 
     # ==================== admin 鉴权 ====================
 
@@ -262,9 +278,8 @@ class ChatController:
             # 保存本轮路由结果
             self._save_last_route(user_input, intent)
 
-            # 权限校验
-            allowed = _ROLE_INTENT_WHITELIST.get(self.user_role, set())
-            if intent not in allowed:
+            # 权限校验（v3：通过 _check_permission() 统一处理，admin 直接放行）
+            if not self._check_permission(intent):
                 msg = (
                     _PERMISSION_DENIED_MESSAGES.get((self.user_role, intent))
                     or _PERMISSION_DENIED_MESSAGES["default"]
@@ -395,14 +410,37 @@ class ChatController:
         }
 
     def _call_job_search(self, query: str) -> dict:
-        """求职者职位搜索，无需 company_id。"""
-        history  = self._get_history("job_search")
-        response = job_search_agent.handle(
-            query      = query,
-            session_id = self.session_id,
-            history    = history,
-            llm        = self.supervisor.llm,
-        )
+        """
+        职位搜索分发：
+            jobseeker → 无 company_id / tenant_id 限制，搜索全平台公开职位
+            admin     → 注入 tenant_id，只搜索该租户下的公开职位（v3 新增）
+        """
+        history = self._get_history("job_search")
+
+        if self.user_role == "admin":
+            tenant_id = self._get_tenant_id()
+            if tenant_id is None:
+                return {
+                    "intent": "job_search",
+                    "data":   {"message": "管理员账号 tenant_id 获取失败，请联系系统管理员。"},
+                    "status": "error",
+                }
+            response = job_search_agent.handle(
+                query      = query,
+                session_id = self.session_id,
+                tenant_id  = tenant_id,
+                history    = history,
+                llm        = self.supervisor.llm,
+            )
+        else:
+            # jobseeker 原有逻辑：不传 tenant_id，搜索全平台
+            response = job_search_agent.handle(
+                query      = query,
+                session_id = self.session_id,
+                history    = history,
+                llm        = self.supervisor.llm,
+            )
+
         self._append_history("job_search", query, response["data"]["message"])
         return response
 
