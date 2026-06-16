@@ -3,25 +3,41 @@ platform_stats_agent.py — 平台管理员数据统计 Agent
 
 定位：仅供 admin 角色使用，查询该租户下的平台级聚合统计数据。
 
-内部三级路由：
-    Level-1  固定模板匹配（无 LLM）
-                ├─ 单模板命中  → 直接执行预设 SQL（支持参数动态注入）
-                └─ 多模板命中  → 并行执行多条预设 SQL，合并结果
-    Level-2  复杂度信号检测    — 含对比/趋势/分析等分析类词时调用 LLM 生成 SQL
-    Level-3  引导语兜底        — 两级均未命中时引导用户换个问法
+内部路由（v3 重构后）：
+    时间词前置检测    — 含"今天/本月/上个月"等时间词时直接走 LLM，
+                        避免固定 SQL 丢失时间条件导致结果不正确
+    固定模板匹配      — 5 个完全无参数的高频统计查询，命中则直接执行预设 SQL
+        ├─ 单模板命中  → 执行对应预设 SQL，返回结构化结果
+        └─ 多模板命中  → 并行执行，合并结果
+    分析词检测        — 命中固定模板但含"对比/趋势/分析/分布"等分析词时走 LLM
+    LLM 兜底          — 未命中固定模板时一律走 LLM，不返回引导语
+
+v1（初始版本）：
+    - 8 个固定模板，支持参数提取（城市/行业/时间动态注入）
+    - _detect_complex_query()：时间词 + 分析词均触发 LLM
+    - 未命中时返回引导语
 
 v2 变更：
-    - 固定模板结构改为 {key: {"keywords": [...], "params": [...]}}，新增 params 字段标记支持的动态参数
-    - 新增 _extract_params()：从 query 提取城市/行业/时间参数
-    - _build_fixed_sql() 支持参数动态注入（城市过滤、时间范围过滤）
-    - _match_fixed_template() 拆分为 _match_fixed_templates()，返回所有命中 key 列表
-    - 新增 _dedup_keys()：job_count 和 job_active 同时命中时保留 job_count
-    - 新增 _execute_multi_templates()：并行执行多条预设 SQL 并合并结果
-    - _format_fixed_result() 新增 params 参数，格式化时感知城市/行业上下文
-    - handle() 主流程重写：支持单/多模板命中及复杂查询分支
-    - _detect_complex_query() 移除时间类信号词，只保留分析/对比类词
-    - _LLM_SQL_SYSTEM 末尾追加多问题 → 数组格式说明
-    - _handle_llm() 支持 LLM 返回单对象或数组，循环执行并合并结果
+    - 固定模板扩充关键词，新增追问场景词
+    - _match_fixed_template() → _match_fixed_templates()，返回所有命中 key 列表
+    - 新增 _dedup_keys()：job_count + job_active 同时命中时保留 job_count
+    - _extract_params() 提取城市/行业/时间，_build_fixed_sql() 支持参数动态注入
+    - _format_fixed_result() 感知城市/行业/时间上下文
+    - _execute_multi_templates() 并行执行多条预设 SQL
+    - _detect_complex_query() 移除时间类词，只保留分析对比类词
+    - _LLM_SQL_SYSTEM 末尾追加多需求 → JSON 数组格式说明
+    - _handle_llm() 支持 LLM 返回单对象或数组
+
+v3 重构：
+    - 固定模板精简为 5 个完全无参数的模板，移除 job_active / job_by_city / company_by_industry
+    - 删除 _extract_params()、_COMPLEX_SIGNALS、_GUIDE_MESSAGE、_guide_response()
+    - 删除所有函数签名中的 params 参数
+    - _detect_complex_query() 改名为 _has_analysis_signals()，职责收窄为"检测分析对比词"
+    - 新增 _TIME_SIGNALS 和时间词前置检测（放在模板匹配之前，逻辑独立）
+    - handle() 主流程简化：时间词 → LLM；固定模板+分析词 → LLM；固定模板 → 预设SQL；其余 → LLM
+    - _build_fixed_sql() 移除所有参数注入，每个模板只有一条固定 SQL
+    - _format_fixed_result() 移除 params 参数
+    - _execute_multi_templates() 移除 params 参数
 
 API 响应统一格式：
     {
@@ -38,7 +54,6 @@ API 响应统一格式：
 import json
 import logging
 import re
-from datetime import datetime, timedelta
 from typing import Optional
 
 from langchain_core.messages import SystemMessage, HumanMessage
@@ -49,13 +64,17 @@ logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────
-# 固定模板配置（v2：含 params 字段）
+# 固定模板配置（v3：精简为 5 个完全无参数的模板）
+#
+# 移除的模板（v3）：
+#   job_active       — 需要城市参数，交给 LLM 处理更准确
+#   job_by_city      — 需要城市参数，交给 LLM 处理更准确
+#   company_by_industry — 需要行业参数，交给 LLM 处理更准确
 # ─────────────────────────────────────────────
 
 # 每个模板结构：
 #   keywords — 触发词列表
 #   params   — 该模板支持动态注入的参数名列表（空表示无动态参数）
-#              可选值：city / industry / time
 _FIXED_TEMPLATES: dict[str, dict] = {
     "company_count": {
         "keywords": ["有多少家", "企业总数", "公司总数", "多少家企业", "多少家公司"],
@@ -65,71 +84,60 @@ _FIXED_TEMPLATES: dict[str, dict] = {
         "keywords": ["待审核企业", "未审核公司", "待审核的企业"],
         "params":   [],
     },
-    "company_by_industry": {
-        "keywords": ["各行业企业", "行业分布", "按行业", "各个行业"],
-        "params":   ["industry"],   # 有行业名 → WHERE 过滤；无行业名 → GROUP BY
-    },
     "job_count": {
         "keywords": [
             "有多少个职位", "职位总数", "岗位总数", "多少个职位",
-            "发布了多少职位", "发布的职位", "多少个在招", "发布了多少个",  # v2 追问场景
+            "发布了多少职位", "发布的职位", "多少个在招", "发布了多少个",
         ],
         "params":   [],
-    },
-    "job_active": {
-        "keywords": [
-            "在招职位", "发布中", "已发布职位",
-            "发布了多少", "多少个发布", "在招的有多少",  # v2 追问场景
-        ],
-        "params":   ["city"],   # 支持城市过滤
     },
     "job_pending": {
         "keywords": ["待审核职位", "未审核职位"],
         "params":   [],
     },
-    "job_by_city": {
-        "keywords": [
-            "各城市职位", "城市分布", "按城市", "各个城市",
-            "各城市在招", "城市职位分布",
-        ],
-        "params":   ["city"],   # 有城市名 → WHERE 过滤；无城市名 → GROUP BY
-    },
     "apply_count": {
-        "keywords": ["报名总数", "报名数", "有多少人报名", "报名情况"],
-        "params":   ["time"],   # 支持时间范围过滤
+        "keywords": ["报名总数", "报名数", "有多少人报名", "报名情况", "报名总量"],
+        "params":   [],
     },
 }
 
 
 # ─────────────────────────────────────────────
-# 复杂度信号词
-# v2 说明：时间词（今天/本月/上个月等）移出，交给 _extract_params() 结构化处理。
-# 只保留"分析/对比/趋势"等需要 LLM 生成复杂 SQL 的场景。
+# 时间词前置检测（v3 新增）
+#
+# 含时间词时直接走 LLM，不进入固定模板匹配。
+# 原因："上个月报名总数"会命中 apply_count，但固定 SQL 无时间条件，结果不正确。
 # ─────────────────────────────────────────────
 
-_COMPLEX_SIGNALS: list[str] = [
-    "对比", "趋势", "增长", "变化", "同比", "环比",
-    "完成率", "转化率", "交叉", "分析",
+_TIME_SIGNALS: list[str] = [
+    "今天", "本周", "本月", "上个月", "上月", "今年",
+    "最近", "昨天", "上周", "去年",
 ]
 
 
 # ─────────────────────────────────────────────
-# 引导语（三级均未命中时返回）
+# 分析信号词（v3：原 _COMPLEX_SIGNALS 改名并精简）
+#
+# 只保留"对比/趋势/分析"等真正需要 LLM 复杂 SQL 的场景。
+# 时间词已移出，由 _TIME_SIGNALS 前置处理。
 # ─────────────────────────────────────────────
 
-_GUIDE_MESSAGE = (
-    "抱歉，我没能理解您的统计需求。您可以这样问我：\n"
-    '· \u201c平台现在有多少家企业\u201d\n'
-    '· \u201c待审核的职位有几个\u201d\n'
-    '· \u201c各城市职位分布情况\u201d\n'
-    '· \u201c平台总报名人数\u201d\n'
-    "如果是更复杂的统计需求，请尽量描述清楚时间范围和统计维度。"
-)
+_ANALYSIS_SIGNALS: list[str] = [
+    "对比", "趋势", "增长", "变化", "同比", "环比",
+    "完成率", "转化率", "交叉", "分析", "分布", "排名",
+]
+
+
+def _has_analysis_signals(query: str) -> bool:
+    """
+    检测是否含分析对比类词（原 _detect_complex_query，v3 改名）。
+    职责收窄为"检测分析对比词"，时间词检测已移到 handle() 前置。
+    """
+    return any(sig in query for sig in _ANALYSIS_SIGNALS)
 
 
 # ─────────────────────────────────────────────
-# LLM Prompt（复杂查询）
-# v2 末尾追加多问题 → 数组格式说明
+# LLM Prompt（复杂查询 / LLM 兜底）
 # ─────────────────────────────────────────────
 
 _LLM_SQL_SYSTEM = """\
@@ -162,82 +170,12 @@ _LLM_SQL_SYSTEM = """\
 
 
 # ─────────────────────────────────────────────
-# 参数提取层（v2 新增）
-# ─────────────────────────────────────────────
-
-def _extract_params(query: str) -> dict:
-    """
-    从 query 中提取动态参数，供固定模板 SQL 动态注入。
-    返回 {"city": str|None, "industry": str|None, "time": dict|None}
-    time 格式：{"start": "YYYY-MM-DD", "end": "YYYY-MM-DD"}
-
-    注意：
-        城市用 LIKE '%xxx%' 而非精确匹配，兼容"东莞"与"东莞市"两种存储格式。
-        行业去后缀（"行"字），避免"制造行业"与数据库"制造业"对不上。
-    """
-    result: dict = {"city": None, "industry": None, "time": None}
-    now = datetime.now()
-
-    # ── 城市提取 ──────────────────────────────────────────
-    city_pattern = re.compile(r"([\u4e00-\u9fa5]{2,6}(?:省|市|区|县|地区|自治区))")
-    city_match = city_pattern.search(query)
-    if city_match:
-        result["city"] = city_match.group(1)
-
-    # ── 行业提取 ──────────────────────────────────────────
-    # 匹配"XX行业"、"XX产业"、"XX领域"，去除末尾"行"字防止和数据库存储不一致
-    industry_pattern = re.compile(r"([\u4e00-\u9fa5]{2,8}(?:行业|产业|领域|行))")
-    industry_match = industry_pattern.search(query)
-    if industry_match:
-        result["industry"] = industry_match.group(1).rstrip("行")
-
-    # ── 时间提取（结构化处理，不再触发 LLM 复杂查询路径）──
-    if "今天" in query:
-        today = now.strftime("%Y-%m-%d")
-        result["time"] = {"start": today, "end": today}
-
-    elif "本周" in query:
-        weekday = now.weekday()
-        start = (now - timedelta(days=weekday)).strftime("%Y-%m-%d")
-        result["time"] = {"start": start, "end": now.strftime("%Y-%m-%d")}
-
-    elif "本月" in query:
-        start = now.strftime("%Y-%m-01")
-        result["time"] = {"start": start, "end": now.strftime("%Y-%m-%d")}
-
-    elif "上个月" in query or "上月" in query:
-        first_of_month    = now.replace(day=1)
-        last_month_end    = first_of_month - timedelta(days=1)
-        last_month_start  = last_month_end.replace(day=1)
-        result["time"] = {
-            "start": last_month_start.strftime("%Y-%m-%d"),
-            "end":   last_month_end.strftime("%Y-%m-%d"),
-        }
-
-    elif "今年" in query:
-        result["time"] = {
-            "start": now.strftime("%Y-01-01"),
-            "end":   now.strftime("%Y-%m-%d"),
-        }
-
-    # 匹配"最近N天"
-    recent_match = re.compile(r"最近(\d+)天").search(query)
-    if recent_match:
-        days  = int(recent_match.group(1))
-        start = (now - timedelta(days=days)).strftime("%Y-%m-%d")
-        result["time"] = {"start": start, "end": now.strftime("%Y-%m-%d")}
-
-    return result
-
-
-# ─────────────────────────────────────────────
-# 多模板匹配与去重（v2 新增）
+# 多模板匹配与去重
 # ─────────────────────────────────────────────
 
 def _match_fixed_templates(query: str) -> list[str]:
     """
     返回所有命中的模板 key 列表（按 _FIXED_TEMPLATES 定义顺序），未命中返回空列表。
-    v2：替换原 _match_fixed_template()（单命中版）。
     """
     text    = query.strip()
     matched = []
@@ -253,7 +191,7 @@ def _dedup_keys(keys: list[str]) -> list[str]:
     """
     去重规则：
         job_count 和 job_active 同时命中时，保留 job_count（状态分组信息更完整）。
-    其余 key 不去重。
+    v3 说明：job_active 已从固定模板移除，此函数保留以防未来重新加入时的防御处理。
     """
     if "job_count" in keys and "job_active" in keys:
         keys = [k for k in keys if k != "job_active"]
@@ -261,22 +199,15 @@ def _dedup_keys(keys: list[str]) -> list[str]:
 
 
 # ─────────────────────────────────────────────
-# 固定 SQL 构建（v2：支持动态参数注入）
+# 固定 SQL 构建（v3：移除所有参数注入，每个模板只有一条固定 SQL）
 # ─────────────────────────────────────────────
 
-def _build_fixed_sql(key: str, tenant_id: int, params: dict) -> Optional[str]:
+def _build_fixed_sql(key: str, tenant_id: int) -> Optional[str]:
     """
-    根据模板 key、tenant_id 和提取到的参数动态构建 SQL。
-    返回 None 时表示参数缺失或配置错误，调用方应降级走 LLM。
-
-    city     用 LIKE '%xxx%' 兼容"东莞"与"东莞市"两种存储格式。
-    industry 去后缀后用 LIKE '%xxx%' 兼容"制造业"与"制造"两种存储格式。
-    time     转化为 BETWEEN 范围条件（end 日期末尾补 23:59:59）。
+    根据模板 key 和 tenant_id 构建固定预设 SQL。
+    v3 变更：移除 params 参数，不再做城市/行业/时间动态注入。
+    含动态条件的查询（城市、行业、时间过滤）一律由 LLM 处理。
     """
-    city     = params.get("city")
-    industry = params.get("industry")
-    time     = params.get("time")
-
     if key == "company_count":
         return (
             f"SELECT COUNT(*) AS total FROM company "
@@ -289,42 +220,12 @@ def _build_fixed_sql(key: str, tenant_id: int, params: dict) -> Optional[str]:
             f"WHERE tenant_id={tenant_id} AND is_delete=0 AND apply_status=0"
         )
 
-    elif key == "company_by_industry":
-        if industry:
-            # 有行业名 → 单行业过滤
-            return (
-                f"SELECT COUNT(*) AS total FROM company "
-                f"WHERE tenant_id={tenant_id} AND is_delete=0 "
-                f"AND industry LIKE '%{industry}%'"
-            )
-        else:
-            # 无行业名 → 按行业分组汇总
-            return (
-                f"SELECT industry, COUNT(*) AS total FROM company "
-                f"WHERE tenant_id={tenant_id} AND is_delete=0 AND apply_status=1 "
-                f"GROUP BY industry ORDER BY total DESC"
-            )
-
     elif key == "job_count":
-        sql = (
+        return (
             f"SELECT status, COUNT(*) AS cnt FROM job "
-            f"WHERE tenant_id={tenant_id} AND is_delete=0"
+            f"WHERE tenant_id={tenant_id} AND is_delete=0 "
+            f"GROUP BY status"
         )
-        if time:
-            sql += f" AND create_time BETWEEN '{time['start']}' AND '{time['end']} 23:59:59'"
-        sql += " GROUP BY status"
-        return sql
-
-    elif key == "job_active":
-        sql = (
-            f"SELECT COUNT(*) AS total FROM job "
-            f"WHERE tenant_id={tenant_id} AND is_delete=0 AND status=1 AND audit_status=1"
-        )
-        if city:
-            sql += f" AND work_city LIKE '%{city}%'"
-        if time:
-            sql += f" AND deploy_time BETWEEN '{time['start']}' AND '{time['end']} 23:59:59'"
-        return sql
 
     elif key == "job_pending":
         return (
@@ -332,56 +233,25 @@ def _build_fixed_sql(key: str, tenant_id: int, params: dict) -> Optional[str]:
             f"WHERE tenant_id={tenant_id} AND is_delete=0 AND audit_status=0"
         )
 
-    elif key == "job_by_city":
-        if city:
-            # 有城市名 → 单城市过滤计数
-            return (
-                f"SELECT COUNT(*) AS total FROM job "
-                f"WHERE tenant_id={tenant_id} AND is_delete=0 "
-                f"AND status=1 AND audit_status=1 AND work_city LIKE '%{city}%'"
-            )
-        else:
-            # 无城市名 → 按城市分组汇总
-            return (
-                f"SELECT work_city, COUNT(*) AS cnt FROM job "
-                f"WHERE tenant_id={tenant_id} AND is_delete=0 "
-                f"AND status=1 AND audit_status=1 "
-                f"GROUP BY work_city ORDER BY cnt DESC LIMIT 20"
-            )
-
     elif key == "apply_count":
-        sql = (
+        return (
             f"SELECT COUNT(*) AS total FROM employees_apply ea "
             f"LEFT JOIN job j ON ea.job_id = j.id "
             f"WHERE j.tenant_id={tenant_id}"
         )
-        if time:
-            sql += f" AND ea.create_time BETWEEN '{time['start']}' AND '{time['end']} 23:59:59'"
-        return sql
 
     return None
 
 
 # ─────────────────────────────────────────────
-# 结果格式化（v2：新增 params 参数，感知城市/行业上下文）
+# 结果格式化（v3：移除 params 参数，不再感知城市/行业/时间上下文）
 # ─────────────────────────────────────────────
 
-def _format_fixed_result(
-    template_key: str,
-    rows:         list[dict],
-    params:       Optional[dict] = None,
-) -> tuple[str, dict]:
+def _format_fixed_result(template_key: str, rows: list[dict]) -> tuple[str, dict]:
     """
     将固定模板查询结果格式化为 (message, stats_dict)。
-    stats_dict 用于响应中的结构化数据字段。
-    params 用于在 message 中加入城市/行业/时间上下文描述。
+    v3 变更：移除 params 参数，格式化逻辑不再感知城市/行业/时间上下文。
     """
-    params = params or {}
-    city     = params.get("city") or ""
-    industry = params.get("industry") or ""
-    time     = params.get("time")
-    time_desc = f"{time['start']} 至 {time['end']}" if time else ""
-
     if not rows:
         return "暂无数据", {}
 
@@ -393,95 +263,59 @@ def _format_fixed_result(
         pending = rows[0].get("total", 0)
         return f"待审核企业共 {pending} 家", {"pending": pending}
 
-    if template_key == "company_by_industry":
-        if industry:
-            # 单行业过滤，返回计数
-            total = rows[0].get("total", 0)
-            return f"{industry}行业企业共 {total} 家", {"total": total}
-        else:
-            # 分组汇总
-            parts = [
-                f"{r.get('industry', '未知')}（{r.get('total', 0)} 家）"
-                for r in rows[:10]
-            ]
-            return "企业行业分布：" + "、".join(parts), {"rows": rows}
-
     if template_key == "job_count":
         _status_label = {0: "未审核", 1: "已发布", 2: "不通过", 3: "停止发布"}
         parts = [
             f"{_status_label.get(r.get('status'), '未知')}（{r.get('cnt', 0)} 个）"
             for r in rows
         ]
-        prefix = f"{time_desc} " if time_desc else ""
-        return f"{prefix}职位状态分布：" + "、".join(parts), {"rows": rows}
-
-    if template_key == "job_active":
-        total     = rows[0].get("total", 0)
-        city_desc = f"{city}" if city else "平台"
-        time_hint = f"（{time_desc}）" if time_desc else ""
-        return f"{city_desc}当前在招职位共 {total} 个{time_hint}", {"total": total}
+        return "职位状态分布：" + "、".join(parts), {"rows": rows}
 
     if template_key == "job_pending":
         total = rows[0].get("total", 0)
         return f"待审核职位共 {total} 个", {"total": total}
 
-    if template_key == "job_by_city":
-        if "work_city" in (rows[0] if rows else {}):
-            # 分组汇总
-            parts = [
-                f"{r.get('work_city', '未知')}（{r.get('cnt', 0)} 个）"
-                for r in rows[:10]
-            ]
-            return "各城市在招职位：" + "、".join(parts), {"rows": rows}
-        else:
-            # 单城市过滤
-            total = rows[0].get("total", 0)
-            return f"{city}当前在招职位共 {total} 个", {"total": total}
-
     if template_key == "apply_count":
-        total     = rows[0].get("total", 0)
-        time_hint = f"（{time_desc}）" if time_desc else ""
-        return f"平台总报名记录共 {total} 条{time_hint}", {"total": total}
+        total = rows[0].get("total", 0)
+        return f"平台总报名记录共 {total} 条", {"total": total}
 
     return "查询完成", {"rows": rows}
 
 
 # ─────────────────────────────────────────────
-# 多模板并行执行与结果合并（v2 新增）
+# 多模板并行执行与结果合并（v3：移除 params 参数）
 # ─────────────────────────────────────────────
 
-def _execute_multi_templates(keys: list[str], tenant_id: int, params: dict) -> dict:
+def _execute_multi_templates(keys: list[str], tenant_id: int) -> dict:
     """
     并行执行多个固定模板 SQL，合并结果。
     单条执行失败时跳过（不终止整体），仍返回其余成功结果。
-
-    去重说明：调用前已经过 _dedup_keys()，这里不再二次去重。
+    v3 变更：移除 params 参数，_build_fixed_sql 和 _format_fixed_result 签名同步简化。
 
     返回：
         {
             "message": "结果1；结果2",
             "stats":   {合并的结构化数据}
         }
-        若全部执行失败，返回 {"message": "暂无数据", "stats": {}}
     """
     messages: list[str] = []
     stats:    dict      = {}
 
     for key in keys:
-        sql = _build_fixed_sql(key, tenant_id, params)
+        sql = _build_fixed_sql(key, tenant_id)
         if sql is None:
             logger.warning(f"[platform_stats] 模板 {key} SQL 构建失败，跳过")
             continue
 
         rows, err = _execute_sql(sql)
         if err:
-            logger.error(f"[platform_stats] 模板 {key} SQL 执行失败: {err}")
+            logger.error(f"[platform_stats] 模板 {key} 执行失败: {err}")
             continue
 
-        msg, stat = _format_fixed_result(key, rows, params)
+        msg, stat = _format_fixed_result(key, rows)
         messages.append(msg)
 
-        # 合并 stats，分组类数据用带前缀的 key 区分避免覆盖
+        # 合并 stats，分组类数据用带前缀的 key 区分，避免多模板结果互相覆盖
         for k, v in stat.items():
             stats_key = f"{key}_{k}" if k in stats else k
             stats[stats_key] = v
@@ -495,15 +329,6 @@ def _execute_multi_templates(keys: list[str], tenant_id: int, params: dict) -> d
 # ─────────────────────────────────────────────
 # 工具函数
 # ─────────────────────────────────────────────
-
-def _detect_complex_query(query: str) -> bool:
-    """
-    检测是否为分析/对比类复杂查询（需要 LLM 生成 SQL）。
-    v2 说明：时间词已从信号词中移除，由 _extract_params() 结构化处理，
-    不再触发 LLM 路径，避免"上个月报名数"这类简单时间过滤被误判为复杂查询。
-    """
-    return any(sig in query for sig in _COMPLEX_SIGNALS)
-
 
 def _execute_sql(sql: str) -> tuple[list[dict], Optional[str]]:
     """
@@ -545,11 +370,6 @@ def _build_response(message: str, stats: Optional[dict] = None, rows: Optional[l
     }
 
 
-def _guide_response() -> dict:
-    """未命中任何规则时返回引导语"""
-    return _build_response(_GUIDE_MESSAGE)
-
-
 def _error_response(message: str) -> dict:
     return {
         "intent": "platform_stats",
@@ -559,11 +379,11 @@ def _error_response(message: str) -> dict:
 
 
 # ─────────────────────────────────────────────
-# LLM 路径（v2：支持单对象/数组两种返回格式）
+# LLM 路径（支持单对象 / 数组两种返回格式）
 # ─────────────────────────────────────────────
 
-def _call_llm(query: str, tenant_id: int, llm: ChatOpenAI) -> str:
-    """调用 LLM 生成 SQL，返回原始字符串（含 JSON）"""
+def _call_llm_raw(query: str, tenant_id: int, llm: ChatOpenAI) -> str:
+    """调用 LLM 生成 SQL，返回清洗后的原始字符串（去除 ``` 围栏）"""
     system   = _LLM_SQL_SYSTEM.replace("{tenant_id}", str(tenant_id))
     messages = [
         SystemMessage(content=system),
@@ -584,20 +404,20 @@ def _handle_llm(query: str, tenant_id: int, llm: ChatOpenAI) -> dict:
     支持 LLM 返回单个对象（一个需求）或数组（多个独立需求）。
     每条 SQL 独立做 tenant_id 安全校验，校验失败时整体拒绝。
     """
-    logger.info(f"[platform_stats] 复杂查询，调用 LLM 生成 SQL: '{query}'")
+    logger.info(f"[platform_stats] 走 LLM 路径: '{query}'")
 
     try:
-        raw    = _call_llm(query, tenant_id, llm)
+        raw    = _call_llm_raw(query, tenant_id, llm)
         parsed = json.loads(raw)
     except Exception as e:
         logger.error(f"[platform_stats] LLM SQL 解析失败: {e}")
-        return _error_response("SQL 生成失败，请换个问法")
+        return _error_response("SQL 生成失败，请换个问法重试")
 
-    # 统一为列表处理
+    # 统一为列表处理（单对象包装为单元素列表）
     items: list[dict] = parsed if isinstance(parsed, list) else [parsed]
 
-    messages: list[str] = []
-    rows_all: list[dict] = []
+    messages:  list[str]  = []
+    rows_all:  list[dict] = []
 
     for item in items:
         sql = item.get("sql", "").strip()
@@ -633,24 +453,18 @@ def handle(
     llm:       Optional[ChatOpenAI] = None,
 ) -> dict:
     """
-    平台统计 Agent 主入口（v2 重写）。
+    平台统计 Agent 主入口（v3 重构）。
 
-    三级路由流程：
-        matched_keys = _dedup_keys(_match_fixed_templates(query))
-        has_complex  = _detect_complex_query(query)
-        params       = _extract_params(query)
-
-        情况一：未命中任何固定模板
-            ├─ has_complex → LLM 路径
-            └─ 否则        → 引导语兜底
-
-        情况二：命中模板，但含复杂信号词（对比/趋势/分析等）
-            └─ 整句走 LLM（不拆模板，保留完整语义）
-
-        情况三：命中模板，无复杂信号词 → 固定 SQL 路径
-            ├─ 模板需要参数 & 参数提取失败 → 降级走 LLM
-            ├─ 单模板命中  → 执行单条预设 SQL → 返回
-            └─ 多模板命中  → 并行执行所有预设 SQL → 合并结果返回
+    路由流程（优先级从高到低）：
+        1. 含时间词（今天/本月/上个月等）
+               → 直接走 LLM（固定 SQL 无时间条件，结果会不正确）
+        2. 命中固定模板 + 含分析词（对比/趋势/分析/分布等）
+               → 整句走 LLM（保留完整语义，LLM 处理分析需求）
+        3. 命中固定模板，无分析词
+               → 单模板：执行对应预设 SQL，返回结构化结果
+               → 多模板：并行执行，合并结果
+        4. 未命中任何固定模板
+               → 直接走 LLM，不返回引导语（v3 移除引导语）
 
     Args:
         query:     用户输入
@@ -664,53 +478,44 @@ def handle(
         logger.error("[platform_stats] llm 未传入")
         return _error_response("系统配置错误，请联系管理员")
 
-    matched_keys = _dedup_keys(_match_fixed_templates(query))
-    has_complex  = _detect_complex_query(query)
-    params       = _extract_params(query)
-
-    # ── 情况一：未命中任何固定模板 ────────────────────────────
-    if not matched_keys:
-        if has_complex:
-            return _handle_llm(query, tenant_id, llm)
-        logger.debug(f"[platform_stats] 未命中任何规则，返回引导语: '{query}'")
-        return _guide_response()
-
-    # ── 情况二：命中模板，但含复杂信号词 → 整句走 LLM ──────────
-    if has_complex:
+    # ── 时间词前置检测（v3 新增）─────────────────────────────────
+    # 含时间词时直接走 LLM，不进入固定模板匹配，避免固定 SQL 丢失时间条件。
+    # 例："上个月报名总数"会命中 apply_count，但固定 SQL 查全量，结果不正确。
+    if any(sig in query for sig in _TIME_SIGNALS):
+        logger.info(f"[platform_stats] 含时间词，直接走 LLM: '{query}'")
         return _handle_llm(query, tenant_id, llm)
 
-    # ── 情况三：命中模板，无复杂信号词 → 固定 SQL 路径 ──────────
-    # 检查每个命中模板：若需要参数且参数提取失败，则降级走 LLM
-    for key in matched_keys:
-        template_params   = _FIXED_TEMPLATES[key]["params"]
-        needs_param       = len(template_params) > 0
-        param_extracted   = any(params.get(p) for p in template_params)
-        if needs_param and not param_extracted:
-            logger.info(
-                f"[platform_stats] 模板 {key} 需要参数 {template_params} "
-                f"但提取失败，降级走 LLM"
-            )
-            return _handle_llm(query, tenant_id, llm)
+    matched_keys = _dedup_keys(_match_fixed_templates(query))
 
-    if len(matched_keys) == 1:
-        # ── 单模板命中：原有逻辑不变 ───────────────────────────
-        key  = matched_keys[0]
-        sql  = _build_fixed_sql(key, tenant_id, params)
-        if sql is None:
-            return _handle_llm(query, tenant_id, llm)
+    # ── 命中固定模板，但含分析对比词 → 整句走 LLM ────────────────
+    if matched_keys and _has_analysis_signals(query):
+        logger.info(f"[platform_stats] 命中模板 {matched_keys} 但含分析词，走 LLM: '{query}'")
+        return _handle_llm(query, tenant_id, llm)
 
-        rows, err = _execute_sql(sql)
-        if err:
-            return _error_response(f"数据查询失败，请稍后重试（{err[:50]}）")
+    # ── 命中固定模板，无分析词 → 预设 SQL 路径 ────────────────────
+    if matched_keys:
+        if len(matched_keys) == 1:
+            # 单模板命中
+            key  = matched_keys[0]
+            sql  = _build_fixed_sql(key, tenant_id)
+            if sql is None:
+                # 理论上不会发生（5 个模板均有固定 SQL），兜底走 LLM
+                return _handle_llm(query, tenant_id, llm)
 
-        message, stats = _format_fixed_result(key, rows, params)
-        # 分组类（含 rows 键）和单值类（含 total/pending 等键）分别返回
-        if "rows" in stats:
-            return _build_response(message, rows=stats["rows"])
-        return _build_response(message, stats=stats)
+            rows, err = _execute_sql(sql)
+            if err:
+                return _error_response("数据查询失败，请稍后重试")
 
-    else:
-        # ── 多模板命中：并行执行，合并结果 ─────────────────────
-        logger.info(f"[platform_stats] 多模板并行执行: {matched_keys}")
-        result = _execute_multi_templates(matched_keys, tenant_id, params)
-        return _build_response(result["message"], stats=result["stats"] or None)
+            message, stats = _format_fixed_result(key, rows)
+            if "rows" in stats:
+                return _build_response(message, rows=stats["rows"])
+            return _build_response(message, stats=stats)
+
+        else:
+            # 多模板命中：并行执行，合并结果
+            logger.info(f"[platform_stats] 多模板并行执行: {matched_keys}")
+            result = _execute_multi_templates(matched_keys, tenant_id)
+            return _build_response(result["message"], stats=result["stats"] or None)
+
+    # ── 未命中任何固定模板 → 直接走 LLM（v3 移除引导语兜底）────────
+    return _handle_llm(query, tenant_id, llm)
