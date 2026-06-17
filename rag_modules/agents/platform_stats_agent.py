@@ -148,6 +148,19 @@ _LLM_SQL_SYSTEM = """\
     job             — 职位信息表
     employees_apply — 员工报名表
 
+    表名：job
+可用查询字段：
+    name         VARCHAR  职位名称，用 LIKE '%xxx%' 模糊匹配
+    company_name VARCHAR  企业名称，用 LIKE '%xxx%' 模糊匹配
+    status       TINYINT  职位状态：0未审核 1已发布 2不通过 3停止发布
+    job_type     TINYINT  职位类型：0全职 1就业 2实习 3临时工
+    audit_status TINYINT  审核状态：0未审核 1通过 2不通过
+    work_city    VARCHAR  工作城市
+    salary_min   INT      最低薪资
+    salary_max   INT      最高薪资
+    create_time  DATETIME 创建时间
+    deploy_time  DATETIME 发布时间
+
 数据隔离规则（最高优先级，不可违反）：
     所有查询必须在 WHERE 中包含对应主表的 tenant_id = {tenant_id} 条件
     跨表 JOIN 时，以 company.tenant_id = {tenant_id} 为主过滤条件

@@ -13,6 +13,16 @@ rule_router.py — 基于关键词/正则的规则快速路由层
     返回 None 表示规则未命中，交由 LLM 处理。
 
 注意：规则层不感知 user_role，角色权限校验由控制器层统一处理。
+
+v3（消歧补丁）变更：
+    - _PLATFORM_STATS_KEYWORDS 移除与 job_manage 高度重叠的歧义词
+    - _JOB_MANAGE_KEYWORDS 接收迁移来的歧义词（有公司归属上下文时命中 job_manage）
+    - 新增 _COMPANY_SCOPE_SIGNALS：公司归属词，触发 platform_stats → job_manage 降级
+    - 新增 _CANDIDATE_SCOPE_SIGNALS：候选人归属词，触发 platform_stats → candidate_search 降级
+    - 新增 _PLATFORM_SCOPE_SIGNALS：平台专属词，用于 candidate_search 正则优先的反向保护
+    - 新增 _disambiguate()：对 platform_stats 命中结果做消歧，按优先级降级
+    - route() 中 platform_stats 命中后调用 _disambiguate() 再返回
+    - route() 中 candidate_search 正则优先命中后加反向保护：同时含平台级词则放行给 LLM
 """
 
 import re
@@ -104,6 +114,9 @@ _JOB_MANAGE_KEYWORDS: list[str] = [
     "我们公司", "公司职位", "公司岗位", "公司在招", "发布的职位",
     "发布的岗位", "我发布", "我们发布", "公司有多少职位",
     "查看职位", "管理职位", "职位列表",
+    # v3 新增：从 _PLATFORM_STATS_KEYWORDS 迁移，有公司归属上下文时命中 job_manage
+    "公司有多少岗位",
+    "发布了多少职位",
 ]
 
 _JOB_MANAGE_PATTERNS: list[re.Pattern] = [
@@ -139,14 +152,15 @@ _CANDIDATE_SEARCH_PATTERNS: list[re.Pattern] = [
 ]
 
 # ── platform_stats（平台管理员统计查询）───────
+# v3 变更：移除与 job_manage 高度重叠的歧义词，只保留平台专属词
 _PLATFORM_STATS_KEYWORDS: list[str] = [
     "平台", "租户", "所有企业", "所有公司", "全平台",
     "企业总数", "公司总数", "职位总数", "岗位总数", "报名总数",
     "统计", "数据概览", "分布情况", "待审核企业", "待审核职位",
     "各城市", "各行业", "新增企业", "新增职位",
-    # v2 补充：追问 / 泛问句场景（防止被 job_manage 关键词抢走）
-    "发布了多少", "多少个职位", "多少个在招", "发布的职位",
-    "多少家", "共有多少", "一共多少",
+    # v3 已移除以下歧义词（原本在此，现迁移到 _JOB_MANAGE_KEYWORDS 或依靠消歧逻辑处理）：
+    # "发布了多少", "多少个职位", "多少个在招", "发布的职位",
+    # "多少家", "共有多少", "一共多少",
 ]
 
 _PLATFORM_STATS_PATTERNS: list[re.Pattern] = [
@@ -244,6 +258,33 @@ _EXACT_MAP: dict[str, Intent] = {
 
 
 # ─────────────────────────────────────────────
+# 消歧信号词（v3 新增）
+# ─────────────────────────────────────────────
+
+# 公司归属词：含这些词时，说明用户在询问"本公司"的数据，
+# 应从 platform_stats 降级为 job_manage
+_COMPANY_SCOPE_SIGNALS: list[str] = [
+    "我们公司", "本公司", "公司发布", "公司职位",
+    "公司岗位", "公司在招", "我发布的", "我们发布",
+]
+
+# 候选人归属词：含这些词时，说明用户在询问某具体职位的报名情况，
+# 应从 platform_stats 降级为 candidate_search
+_CANDIDATE_SCOPE_SIGNALS: list[str] = [
+    "有多少人报名", "报名了多少", "职位报名",
+    "候选人有多少", "报名人数", "多少人投了",
+]
+
+# 平台专属词：用于 candidate_search 正则优先检测的反向保护。
+# 命中 candidate_search 正则但同时含有这些词时，说明意图模糊，
+# 放行给 LLM 处理（返回 None）
+_PLATFORM_SCOPE_SIGNALS: list[str] = [
+    "所有企业", "所有公司", "全平台", "平台统计",
+    "各城市", "各行业", "租户", "数据概览",
+]
+
+
+# ─────────────────────────────────────────────
 # 核心路由类
 # ─────────────────────────────────────────────
 
@@ -257,6 +298,10 @@ class RuleRouter:
     置信度机制：
         每个意图通过"关键词命中数 + 正则命中数"累加得分，
         只有得分 ≥ confidence_threshold 才认为命中，防止单词误判。
+
+    v3 消歧补丁：
+        platform_stats 命中后调用 _disambiguate() 尝试降级；
+        candidate_search 正则优先命中后加反向保护防止误抢平台级查询。
     """
 
     def __init__(self, confidence_threshold: int = 1):
@@ -268,11 +313,13 @@ class RuleRouter:
         """
         self.confidence_threshold = confidence_threshold
         logger.info(f"RuleRouter 初始化完成，置信度阈值={confidence_threshold}")
-        # ── 公开接口 ──────────────────────────────
+
+    # ── 公开接口 ──────────────────────────────
 
     def route(self, query: str) -> Optional[Intent]:
         """
         尝试对 query 进行规则路由。
+
         Args:
             query: 原始用户输入
 
@@ -293,7 +340,15 @@ class RuleRouter:
             return None
 
         # 2. candidate_search 正则优先（防止"筛选简历"被 resume_parse 关键词抢走）
+        #    v3 新增反向保护：同时含平台专属词时，意图模糊，放行给 LLM
         if _match_any_pattern(text, _CANDIDATE_SEARCH_PATTERNS):
+            if _any_keyword(text, _PLATFORM_SCOPE_SIGNALS):
+                # 同时命中 candidate_search 正则和平台专属词，意图不明确，交 LLM 处理
+                logger.debug(
+                    f"[规则路由] candidate_search 正则命中但含平台专属词，"
+                    f"放行给 LLM: '{query}'"
+                )
+                return None
             if not _match_any_pattern(text, _CHITCHAT_PATTERNS):
                 logger.info(f"[规则路由] candidate_search 正则优先命中 '{query}'")
                 return "candidate_search"
@@ -303,6 +358,7 @@ class RuleRouter:
         #           → platform_stats → job_manage → knowledge → chitchat
         # v2 调整：platform_stats 移到 job_manage 前，
         #          防止"发布了多少职位"被 job_manage 的"发布的职位"关键词抢走
+        # v3 调整：platform_stats 命中后调用 _disambiguate() 尝试降级
         for intent_label, kw_list, pat_list in [
             ("platform_stats",   _PLATFORM_STATS_KEYWORDS,   _PLATFORM_STATS_PATTERNS),    # v2 调整：移至 job_manage 前
             ("resume_parse",     _RESUME_KEYWORDS,           _RESUME_PATTERNS),
@@ -314,6 +370,14 @@ class RuleRouter:
         ]:
             score = self._score(text, kw_list, pat_list)
             if score >= self.confidence_threshold:
+                if intent_label == "platform_stats":
+                    # v3 消歧：platform_stats 命中后尝试降级
+                    disambiguated = self._disambiguate(text)
+                    logger.info(
+                        f"[规则路由] platform_stats 消歧: '{query}' → {disambiguated} "
+                        f"(score={score})"
+                    )
+                    return disambiguated  # type: ignore
                 logger.info(f"[规则路由] 命中 '{query}' → {intent_label} (score={score})")
                 return intent_label  # type: ignore
 
@@ -346,6 +410,35 @@ class RuleRouter:
         }
 
     # ── 私有方法 ──────────────────────────────
+
+    def _disambiguate(self, text: str) -> Intent:
+        """
+        消歧方法（v3 新增）：对打分循环命中 platform_stats 的输入做二次判断，
+        按优先级尝试降级到更精确的意图。
+
+        消歧优先级（从高到低）：
+            1. 含公司归属词（_COMPANY_SCOPE_SIGNALS）→ 降级为 job_manage
+            2. 含候选人归属词（_CANDIDATE_SCOPE_SIGNALS）→ 降级为 candidate_search
+            3. 无上述信号词 → 保持 platform_stats
+
+        Args:
+            text: 已归一化（小写）的用户输入
+
+        Returns:
+            消歧后的 Intent
+        """
+        # 优先级 1：含公司归属词 → 是招聘者在查自己公司的数据
+        if _any_keyword(text, _COMPANY_SCOPE_SIGNALS):
+            logger.info(f"[消歧] 含公司归属词，platform_stats → job_manage: '{text}'")
+            return "job_manage"
+
+        # 优先级 2：含候选人归属词 → 是招聘者在查具体职位的报名情况
+        if _any_keyword(text, _CANDIDATE_SCOPE_SIGNALS):
+            logger.info(f"[消歧] 含候选人归属词，platform_stats → candidate_search: '{text}'")
+            return "candidate_search"
+
+        # 无上述信号词 → 保持 platform_stats（真正的平台级查询）
+        return "platform_stats"
 
     def _exact_match(self, text: str) -> Optional[Intent]:
         """精确短句映射，text 已归一化小写"""
