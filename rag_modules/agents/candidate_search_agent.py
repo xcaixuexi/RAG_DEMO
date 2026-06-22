@@ -7,7 +7,7 @@ admin 路径：SQL 注入 tenant_id，可查该租户下所有公司的候选人
 
 API 响应格式：
     {
-        "intent": "candidate_search",
+        "intent": "candidate_query",
         "data": {
             "total": 50,
             "candidates": [...],
@@ -24,6 +24,15 @@ v2 变更：
     - _validate_company_id() 扩展为 _validate_scope_filter()，同时支持 company_id 和 tenant_id
     - handle() 入口根据参数选择对应 Prompt 模板
     - 新增 count-only 模式（只查总数时跳过 list_sql）
+
+v3 变更（方案一）：
+    - intent 字段值由 "candidate_search" 改为 "candidate_query"（与新意图名统一）
+    - _SQL_SYSTEM_ADMIN_TEMPLATE 扩展，补充报名统计 Few-Shot：
+        · 查询总报名人数（count-only）
+        · 查询某职位的报名总数
+        · 查询在职员工数（status=3）
+      对应从 platform_stats_agent 迁出的 apply_count 场景
+    - recruiter Prompt 不变
 """
 
 import json
@@ -127,6 +136,8 @@ Few-Shot 示例（company_id 均用 $company_id）
 
 # ─────────────────────────────────────────────
 # Prompt — admin 版（注入 tenant_id）
+# v3 扩展：补充报名统计 Few-Shot（总报名数、某职位报名总数、在职员工数）
+# 对应从 platform_stats_agent 迁出的 apply_count 场景
 # ─────────────────────────────────────────────
 
 _SQL_SYSTEM_ADMIN_TEMPLATE = Template("""你是一个招聘数据库查询助手，正在帮助平台管理员查询该租户下所有公司的候选人和报名情况。
@@ -148,6 +159,7 @@ _SQL_SYSTEM_ADMIN_TEMPLATE = Template("""你是一个招聘数据库查询助手
     平台审核：ea.audit_type（1待审核 2录用 3不适合）
     期望薪资：ea.expected_salary
     报名方式：ea.emp_way（0自主 1代替）
+    报名时间：ea.create_time（可用 BETWEEN 做时间范围过滤）
 
 重要限制（数据隔离）：
     所有查询必须加上 c.tenant_id = $tenant_id 条件（通过 company 表关联过滤）。
@@ -159,6 +171,7 @@ _SQL_SYSTEM_ADMIN_TEMPLATE = Template("""你是一个招聘数据库查询助手
     1. WHERE 必须包含 c.tenant_id = $tenant_id AND ea.status != 5
     2. list_sql 加 ORDER BY ea.create_time DESC 和 LIMIT 100（固定，不可更改）
     3. count_sql 不加 LIMIT
+    4. 统计类查询（总报名数、按职位/状态分组等）：count_sql 可使用 GROUP BY 或纯 COUNT(*)
 
 list_sql 固定 SELECT 字段：
     ea.id as apply_id, ea.user_id, ea.resume_id, ea.job_id,
@@ -189,6 +202,33 @@ Few-Shot 示例（tenant_id 均用 $tenant_id）
     "count_sql": "SELECT COUNT(*) AS total FROM employees_apply ea LEFT JOIN job j ON ea.job_id = j.id LEFT JOIN company c ON ea.company_id = c.id WHERE c.tenant_id = $tenant_id AND ea.status != 5",
     "list_sql": "SELECT ea.id as apply_id, ea.user_id, ea.resume_id, ea.job_id, COALESCE(j.name, ea.job_name) as job_name, ea.company_id, COALESCE(c.name, ea.work_company_name) as company_name, ea.expected_salary, ea.status, ea.audit_type, ea.emp_way, ea.create_time, ea.audit_time, ea.cancel_time, ea.remark, ea.reason FROM employees_apply ea LEFT JOIN job j ON ea.job_id = j.id LEFT JOIN company c ON ea.company_id = c.id WHERE c.tenant_id = $tenant_id AND ea.status != 5 ORDER BY ea.create_time DESC LIMIT 100",
     "message": "查询租户下所有报名记录"
+}
+
+【示例3 — 查询总报名人数（count-only 统计）】
+用户输入: 平台总报名数是多少
+输出:
+{
+    "count_sql": "SELECT COUNT(*) AS total FROM employees_apply ea LEFT JOIN job j ON ea.job_id = j.id LEFT JOIN company c ON ea.company_id = c.id WHERE c.tenant_id = $tenant_id AND ea.status != 5",
+    "list_sql": "SELECT ea.id as apply_id, ea.user_id, ea.resume_id, ea.job_id, COALESCE(j.name, ea.job_name) as job_name, ea.company_id, COALESCE(c.name, ea.work_company_name) as company_name, ea.expected_salary, ea.status, ea.audit_type, ea.emp_way, ea.create_time, ea.audit_time, ea.cancel_time, ea.remark, ea.reason FROM employees_apply ea LEFT JOIN job j ON ea.job_id = j.id LEFT JOIN company c ON ea.company_id = c.id WHERE c.tenant_id = $tenant_id AND ea.status != 5 ORDER BY ea.create_time DESC LIMIT 100",
+    "message": "查询租户下总报名记录数"
+}
+
+【示例4 — 查询在职员工数（count-only 统计）】
+用户输入: 目前在职的员工有多少
+输出:
+{
+    "count_sql": "SELECT COUNT(*) AS total FROM employees_apply ea LEFT JOIN job j ON ea.job_id = j.id LEFT JOIN company c ON ea.company_id = c.id WHERE c.tenant_id = $tenant_id AND ea.status = 3",
+    "list_sql": "SELECT ea.id as apply_id, ea.user_id, ea.resume_id, ea.job_id, COALESCE(j.name, ea.job_name) as job_name, ea.company_id, COALESCE(c.name, ea.work_company_name) as company_name, ea.expected_salary, ea.status, ea.audit_type, ea.emp_way, ea.create_time, ea.audit_time, ea.cancel_time, ea.remark, ea.reason FROM employees_apply ea LEFT JOIN job j ON ea.job_id = j.id LEFT JOIN company c ON ea.company_id = c.id WHERE c.tenant_id = $tenant_id AND ea.status = 3 ORDER BY ea.create_time DESC LIMIT 100",
+    "message": "查询租户下在职员工数"
+}
+
+【示例5 — 带时间范围的报名统计】
+用户输入: 本月新增了多少报名
+输出:
+{
+    "count_sql": "SELECT COUNT(*) AS total FROM employees_apply ea LEFT JOIN job j ON ea.job_id = j.id LEFT JOIN company c ON ea.company_id = c.id WHERE c.tenant_id = $tenant_id AND ea.status != 5 AND ea.create_time >= DATE_FORMAT(NOW(), '%Y-%m-01')",
+    "list_sql": "SELECT ea.id as apply_id, ea.user_id, ea.resume_id, ea.job_id, COALESCE(j.name, ea.job_name) as job_name, ea.company_id, COALESCE(c.name, ea.work_company_name) as company_name, ea.expected_salary, ea.status, ea.audit_type, ea.emp_way, ea.create_time, ea.audit_time, ea.cancel_time, ea.remark, ea.reason FROM employees_apply ea LEFT JOIN job j ON ea.job_id = j.id LEFT JOIN company c ON ea.company_id = c.id WHERE c.tenant_id = $tenant_id AND ea.status != 5 AND ea.create_time >= DATE_FORMAT(NOW(), '%Y-%m-01') ORDER BY ea.create_time DESC LIMIT 100",
+    "message": "查询租户下本月新增报名记录数"
 }
 ═══════════════════════════════════════════════""")
 
@@ -267,12 +307,14 @@ def _validate_scope_filter(sql: str, company_id: Optional[int], tenant_id: Optio
 
 
 def _error_response(message):
-    return {"intent": "candidate_search", "data": {"message": message}, "status": "error"}
+    # v3：intent 字段改为 candidate_query
+    return {"intent": "candidate_query", "data": {"message": message}, "status": "error"}
 
 
 def _build_response(page_data, total_db, message):
+    # v3：intent 字段改为 candidate_query
     return {
-        "intent": "candidate_search",
+        "intent": "candidate_query",
         "data": {
             "message":     message,
             "candidates":  page_data["items"],
@@ -336,6 +378,8 @@ def handle(
 
     count_sql = parsed["count_sql"]
     list_sql  = parsed["list_sql"]
+    logger.info(f"[candidate_search_agent]  count_sql: {count_sql}")
+    logger.info(f"[candidate_search_agent]  list_sql:  {list_sql}")
     llm_msg   = parsed.get("message", "查询候选人")
 
     # 第三道防线：SQL 安全校验
@@ -359,8 +403,9 @@ def handle(
     if count_only:
         if total_db < 0:
             total_db = 0
+        # v3：intent 字段改为 candidate_query
         return {
-            "intent": "candidate_search",
+            "intent": "candidate_query",
             "data": {
                 "message":    f"{llm_msg}，共 {total_db} 条记录",
                 "candidates": [],
@@ -375,8 +420,9 @@ def handle(
         total_db = len(candidates)
 
     if not candidates:
+        # v3：intent 字段改为 candidate_query
         return {
-            "intent": "candidate_search",
+            "intent": "candidate_query",
             "data": {
                 "message": f"{llm_msg}，暂无符合条件的候选人",
                 "candidates": [],

@@ -23,6 +23,15 @@ v2 变更：
     - 新增 _SQL_SYSTEM_ADMIN_TEMPLATE（tenant_id 版 Prompt）
     - _validate_company_id() 扩展为 _validate_scope_filter()，同时支持 company_id 和 tenant_id
     - handle() 入口根据参数选择对应 Prompt 模板
+
+v3 变更（方案一）：
+    - _SQL_SYSTEM_ADMIN_TEMPLATE 扩展，补充统计场景 Few-Shot 示例：
+        · 查询在招职位总数（count-only）
+        · 查询各城市职位分布（GROUP BY work_city）
+        · 查询待审核职位数（audit_status=0）
+        · 查询某城市在招职位数（带城市过滤）
+      对应 platform_stats_agent 迁出的 job_active/job_pending/job_by_city/job_count 场景
+    - recruiter Prompt 不变（recruiter 不接收跨城市统计需求）
 """
 
 import json
@@ -124,6 +133,8 @@ Few-Shot 示例（company_id 均用 $company_id）
 
 # ─────────────────────────────────────────────
 # Prompt — admin 版（注入 tenant_id）
+# v3 扩展：补充统计场景 Few-Shot（各城市分布、待审核职位、在招总数、按状态分组统计）
+# 对应从 platform_stats_agent 迁出的 job_active/job_pending/job_by_city/job_count 场景
 # ─────────────────────────────────────────────
 
 _SQL_SYSTEM_ADMIN_TEMPLATE = Template("""你是一个招聘数据库查询助手，正在帮助平台管理员查看该租户下所有公司发布的职位。
@@ -155,6 +166,8 @@ _SQL_SYSTEM_ADMIN_TEMPLATE = Template("""你是一个招聘数据库查询助手
        job_exp, education, job_type, job_duty, work_city,
        contact_name, contact_phone, welfare, status, audit_status
     6. count_sql 固定为：SELECT COUNT(*) AS total FROM job WHERE ...
+    7. 统计类查询（各城市分布、按状态分组等）：
+       count_sql 使用 GROUP BY 聚合，list_sql 照常生成（前端可忽略）
 
 只输出 JSON，格式：{"count_sql": "...", "list_sql": "...", "message": "..."}
 
@@ -178,6 +191,51 @@ Few-Shot 示例（tenant_id 均用 $tenant_id）
     "count_sql": "SELECT COUNT(*) AS total FROM job WHERE tenant_id = $tenant_id AND is_delete = 0 AND company_name LIKE '%XX科技%'",
     "list_sql": "SELECT id, name, company_name, company_logo, salary, salary_min, salary_max, job_exp, education, job_type, job_duty, work_city, contact_name, contact_phone, welfare, status, audit_status FROM job WHERE tenant_id = $tenant_id AND is_delete = 0 AND company_name LIKE '%XX科技%' ORDER BY deploy_time DESC LIMIT 100",
     "message": "查询XX科技公司发布的职位"
+}
+
+【示例3 — 查询在招职位总数（count-only 统计）】
+用户输入: 在招职位有多少个
+输出:
+{
+    "count_sql": "SELECT COUNT(*) AS total FROM job WHERE tenant_id = $tenant_id AND is_delete = 0 AND status = 1 AND audit_status = 1",
+    "list_sql": "SELECT id, name, company_name, company_logo, salary, salary_min, salary_max, job_exp, education, job_type, job_duty, work_city, contact_name, contact_phone, welfare, status, audit_status FROM job WHERE tenant_id = $tenant_id AND is_delete = 0 AND status = 1 AND audit_status = 1 ORDER BY deploy_time DESC LIMIT 100",
+    "message": "查询租户下在招职位总数"
+}
+
+【示例4 — 各城市在招职位分布（GROUP BY 统计）】
+用户输入: 各城市职位分布情况
+输出:
+{
+    "count_sql": "SELECT work_city, COUNT(*) AS cnt FROM job WHERE tenant_id = $tenant_id AND is_delete = 0 AND status = 1 AND audit_status = 1 GROUP BY work_city ORDER BY cnt DESC LIMIT 20",
+    "list_sql": "SELECT id, name, company_name, company_logo, salary, salary_min, salary_max, job_exp, education, job_type, job_duty, work_city, contact_name, contact_phone, welfare, status, audit_status FROM job WHERE tenant_id = $tenant_id AND is_delete = 0 AND status = 1 AND audit_status = 1 ORDER BY deploy_time DESC LIMIT 100",
+    "message": "查询租户下各城市在招职位分布"
+}
+
+【示例5 — 查询待审核职位数（count-only 统计）】
+用户输入: 待审核的职位有几个
+输出:
+{
+    "count_sql": "SELECT COUNT(*) AS total FROM job WHERE tenant_id = $tenant_id AND is_delete = 0 AND audit_status = 0",
+    "list_sql": "SELECT id, name, company_name, company_logo, salary, salary_min, salary_max, job_exp, education, job_type, job_duty, work_city, contact_name, contact_phone, welfare, status, audit_status FROM job WHERE tenant_id = $tenant_id AND is_delete = 0 AND audit_status = 0 ORDER BY deploy_time DESC LIMIT 100",
+    "message": "查询租户下待审核职位数"
+}
+
+【示例6 — 查询某城市在招职位数（带城市过滤）】
+用户输入: 深圳有多少个在招职位
+输出:
+{
+    "count_sql": "SELECT COUNT(*) AS total FROM job WHERE tenant_id = $tenant_id AND is_delete = 0 AND status = 1 AND audit_status = 1 AND work_city LIKE '%深圳%'",
+    "list_sql": "SELECT id, name, company_name, company_logo, salary, salary_min, salary_max, job_exp, education, job_type, job_duty, work_city, contact_name, contact_phone, welfare, status, audit_status FROM job WHERE tenant_id = $tenant_id AND is_delete = 0 AND status = 1 AND audit_status = 1 AND work_city LIKE '%深圳%' ORDER BY deploy_time DESC LIMIT 100",
+    "message": "查询深圳在招职位数"
+}
+
+【示例7 — 按职位状态分组统计（全量统计）】
+用户输入: 职位总数是多少，各状态分别有多少
+输出:
+{
+    "count_sql": "SELECT status, COUNT(*) AS cnt FROM job WHERE tenant_id = $tenant_id AND is_delete = 0 GROUP BY status",
+    "list_sql": "SELECT id, name, company_name, company_logo, salary, salary_min, salary_max, job_exp, education, job_type, job_duty, work_city, contact_name, contact_phone, welfare, status, audit_status FROM job WHERE tenant_id = $tenant_id AND is_delete = 0 ORDER BY deploy_time DESC LIMIT 100",
+    "message": "查询租户下职位各状态分布"
 }
 ═══════════════════════════════════════════════""")
 
@@ -328,6 +386,10 @@ def handle(
 
     count_sql = parsed["count_sql"]
     list_sql  = parsed["list_sql"]
+
+    logger.info(f"[job_manage_agent]  count_sql: {count_sql}")
+    logger.info(f"[job_manage_agent]  list_sql:  {list_sql}")
+
     llm_msg   = parsed.get("message", "查询公司职位")
 
     # 第三道防线：SQL 安全校验

@@ -39,6 +39,16 @@ v3 重构：
     - _format_fixed_result() 移除 params 参数
     - _execute_multi_templates() 移除 params 参数
 
+v4 修复（_LLM_SQL_SYSTEM Prompt 问题修复）：
+    - 修复字段说明缺失：原 Prompt 只罗列了三张表名，job 表字段说明被错误地插入在
+      "可查询的表"和"数据隔离规则"中间，且完全没有 company 表和 employees_apply 表的
+      字段说明，导致 LLM 在涉及这两张表的查询时容易编造字段名或查询失败。
+      现已补全三张表的完整字段清单（字段名、类型、含义、可选值域），并说明三表关联关系
+      及 employees_apply 表本身无 tenant_id、必须 JOIN company/job 获取 tenant_id 的隔离规则。
+    - 修复缺少 Few-Shot 示例：原 Prompt 只给了"多需求 JSON 数组"的格式说明，没有任何
+      具体查询示例。现新增 7 个 Few-Shot 示例，覆盖单表统计、GROUP BY 分组、时间范围过滤、
+      跨表 JOIN（employees_apply 关联 company/job）、多需求数组、单需求单对象等典型场景。
+
 API 响应统一格式：
     {
         "intent": "platform_stats",
@@ -77,11 +87,11 @@ logger = logging.getLogger(__name__)
 #   params   — 该模板支持动态注入的参数名列表（空表示无动态参数）
 _FIXED_TEMPLATES: dict[str, dict] = {
     "company_count": {
-        "keywords": ["有多少家", "企业总数", "公司总数", "多少家企业", "多少家公司"],
+        "keywords": ["企业总数", "公司总数", "多少家企业", "多少家公司"],
         "params":   [],
     },
     "company_pending": {
-        "keywords": ["待审核企业", "未审核公司", "待审核的企业"],
+        "keywords": ["待审核企业", "未审核公司", "待审核公司", "未审核企业"],
         "params":   [],
     },
     "job_count": {
@@ -143,43 +153,116 @@ def _has_analysis_signals(query: str) -> bool:
 _LLM_SQL_SYSTEM = """\
 你是平台数据统计助手，根据管理员的自然语言需求，生成查询 SQL。
 
-可查询的表（必须在白名单内）：
-    company         — 企业信息表
-    job             — 职位信息表
-    employees_apply — 员工报名表
+可查询的表（必须在白名单内，禁止查询任何其他表）：
 
-    表名：job
-可用查询字段：
-    name         VARCHAR  职位名称，用 LIKE '%xxx%' 模糊匹配
-    company_name VARCHAR  企业名称，用 LIKE '%xxx%' 模糊匹配
-    status       TINYINT  职位状态：0未审核 1已发布 2不通过 3停止发布
-    job_type     TINYINT  职位类型：0全职 1就业 2实习 3临时工
-    audit_status TINYINT  审核状态：0未审核 1通过 2不通过
-    work_city    VARCHAR  工作城市
-    salary_min   INT      最低薪资
-    salary_max   INT      最高薪资
-    create_time  DATETIME 创建时间
-    deploy_time  DATETIME 发布时间
+【company — 企业信息表】
+    id              BIGINT    主键
+    tenant_id       BIGINT    归属租户
+    name            VARCHAR   公司名称，用 LIKE '%xxx%' 模糊匹配
+    industry        VARCHAR   行业，用 LIKE '%xxx%' 模糊匹配
+    province        VARCHAR   省
+    city            VARCHAR   市
+    county          VARCHAR   区/县
+    is_delete       TINYINT   0正常 1假删除
+    apply_status    TINYINT   审核状态：0未审核 1已通过 2不通过
+    company_type    VARCHAR   factory用工企业 / humen人力资源 / platform租户平台
+    is_well_known   TINYINT   是否名企：0否 1是
+    create_time     DATETIME  创建时间
+    checked_time    DATETIME  审核时间
+
+【job — 职位信息表】
+    id              BIGINT    主键
+    tenant_id       BIGINT    归属租户
+    company_id      BIGINT    所属企业 id
+    name            VARCHAR   职位名称，用 LIKE '%xxx%' 模糊匹配
+    company_name    VARCHAR   企业名称冗余字段，用 LIKE '%xxx%' 模糊匹配
+    job_type        TINYINT   职位类型：0全职 1就业 2实习 3临时工
+    status          TINYINT   职位状态：0未审核 1已发布 2不通过 3停止发布
+    audit_status    TINYINT   审核状态：0未审核 1通过 2不通过
+    is_delete       TINYINT   0正常 1假删除
+    work_city       VARCHAR   工作城市，用 LIKE '%xxx%' 模糊匹配
+    industry        VARCHAR   行业名称
+    salary_min      INT       最低工资
+    salary_max      INT       最高工资
+    job_exp         VARCHAR   工作经验：不限/应届生/3年及以下/3-5年/5-10年/10年以上
+    education       VARCHAR   学历要求：不限/大专/本科/硕士/博士
+    create_time     DATETIME  创建时间
+    deploy_time     DATETIME  发布时间（审核通过时更新）
+
+【employees_apply — 员工报名表（别名 ea）】
+    id                  BIGINT    主键
+    user_id             BIGINT    报名用户 id
+    job_id              BIGINT    职位 id，关联 job.id
+    company_id          BIGINT    企业 id，关联 company.id（注意：本表无 tenant_id 字段，
+                                  必须通过 JOIN company 表获取 tenant_id 过滤）
+    status              TINYINT   1审核中 2未通过 3在职 4已离职 5报名取消
+    audit_type          TINYINT   平台审核状态：1待审核 2录用 3不适合
+    expected_salary     DECIMAL   期望薪资（元/小时）
+    create_time         DATETIME  报名时间
+    job_name            VARCHAR   职位名称冗余字段
+    work_company_name   VARCHAR   工作企业名称冗余字段
+
+表关联关系：
+    job.company_id = company.id
+    employees_apply.job_id = job.id
+    employees_apply.company_id = company.id
 
 数据隔离规则（最高优先级，不可违反）：
-    所有查询必须在 WHERE 中包含对应主表的 tenant_id = {tenant_id} 条件
-    跨表 JOIN 时，以 company.tenant_id = {tenant_id} 为主过滤条件
+    company 和 job 表本身带 tenant_id 字段，查询时直接 WHERE tenant_id = {tenant_id}
+    employees_apply 表没有 tenant_id 字段，必须 LEFT JOIN company（或 job）表，
+        用 company.tenant_id = {tenant_id} 或 job.tenant_id = {tenant_id} 作为过滤条件
 
 固定规则：
     1. 只生成 SELECT 语句
     2. 聚合查询（含 GROUP BY）无需 LIMIT；列表查询加 LIMIT 200
-    3. 条件不确定时宁可不加，不要强行猜测
+    3. 条件不确定时宁可不加，不要强行猜测，不要编造字段名
     4. 不要使用 UNION，多个统计需求请生成多条独立 SQL
+    5. 涉及 employees_apply 的查询，默认排除 status=5（已取消报名），除非用户明确要看取消记录
 
-若用户问题包含多个独立统计需求，请生成多条独立 SQL，以 JSON 数组形式返回：
+只输出 JSON，不要输出任何其他内容（不要 Markdown 代码块围栏）。
+
+═══════════════════════════════════════════════
+Few-Shot 示例
+═══════════════════════════════════════════════
+
+【示例1 — 单表统计：企业行业分布】
+用户输入: 各行业企业数量分布
+输出:
+{"sql": "SELECT industry, COUNT(*) AS cnt FROM company WHERE tenant_id={tenant_id} AND is_delete=0 GROUP BY industry ORDER BY cnt DESC", "message": "查询各行业企业数量分布"}
+
+【示例2 — 单表统计：职位按城市分组】
+用户输入: 各城市职位分布情况
+输出:
+{"sql": "SELECT work_city, COUNT(*) AS cnt FROM job WHERE tenant_id={tenant_id} AND is_delete=0 AND status=1 AND audit_status=1 GROUP BY work_city ORDER BY cnt DESC LIMIT 50", "message": "查询各城市在招职位分布"}
+
+【示例3 — 时间范围过滤：本月新增企业】
+用户输入: 本月新增了多少家企业
+输出:
+{"sql": "SELECT COUNT(*) AS total FROM company WHERE tenant_id={tenant_id} AND is_delete=0 AND create_time >= DATE_FORMAT(NOW(), '%Y-%m-01')", "message": "查询本月新增企业数"}
+
+【示例4 — 跨表 JOIN：员工报名表关联 company 取 tenant_id】
+用户输入: 平台总报名人数是多少
+输出:
+{"sql": "SELECT COUNT(*) AS total FROM employees_apply ea LEFT JOIN company c ON ea.company_id = c.id WHERE c.tenant_id={tenant_id} AND ea.status != 5", "message": "查询平台总报名人数"}
+
+【示例5 — 跨表 JOIN：按职位名称统计报名趋势】
+用户输入: 产品经理职位报名人数趋势
+输出:
+{"sql": "SELECT DATE(ea.create_time) AS day, COUNT(*) AS cnt FROM employees_apply ea LEFT JOIN job j ON ea.job_id = j.id LEFT JOIN company c ON ea.company_id = c.id WHERE c.tenant_id={tenant_id} AND ea.status != 5 AND (j.name LIKE '%产品经理%' OR ea.job_name LIKE '%产品经理%') GROUP BY DATE(ea.create_time) ORDER BY day", "message": "查询产品经理职位报名人数趋势"}
+
+【示例6 — 多个独立统计需求，返回 JSON 数组】
+用户输入: 企业总数和待审核企业数分别是多少
+输出:
 [
-  {{"sql": "SELECT COUNT(*) FROM company WHERE tenant_id={tenant_id}", "message": "企业总数查询"}},
-  {{"sql": "SELECT COUNT(*) FROM job WHERE tenant_id={tenant_id} AND status=1", "message": "在招职位查询"}}
+  {"sql": "SELECT COUNT(*) AS total FROM company WHERE tenant_id={tenant_id} AND is_delete=0", "message": "企业总数查询"},
+  {"sql": "SELECT COUNT(*) AS total FROM company WHERE tenant_id={tenant_id} AND is_delete=0 AND apply_status=0", "message": "待审核企业数查询"}
 ]
-若只有一个需求，仍返回单个对象（非数组）：
-{{"sql": "...", "message": "一句话说明查询意图"}}
 
-只输出 JSON，不要输出任何其他内容。"""
+【示例7 — 单个需求仍返回单对象（非数组）】
+用户输入: 在招职位有多少个
+输出:
+{"sql": "SELECT COUNT(*) AS total FROM job WHERE tenant_id={tenant_id} AND is_delete=0 AND status=1 AND audit_status=1", "message": "查询在招职位总数"}
+═══════════════════════════════════════════════"""
 
 
 # ─────────────────────────────────────────────
@@ -422,6 +505,7 @@ def _handle_llm(query: str, tenant_id: int, llm: ChatOpenAI) -> dict:
     try:
         raw    = _call_llm_raw(query, tenant_id, llm)
         parsed = json.loads(raw)
+        logger.info(f"[platform_stats] SQL 解析成功: {parsed}")
     except Exception as e:
         logger.error(f"[platform_stats] LLM SQL 解析失败: {e}")
         return _error_response("SQL 生成失败，请换个问法重试")

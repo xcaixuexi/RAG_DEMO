@@ -34,6 +34,25 @@ v3 变更：
     - _call_job_search() 新增 admin 分支：透传 tenant_id 给 job_search_agent
     - _call_job_manage() / _call_candidate_search() admin 分支保持不变（已有）
     - 移除 ("admin", "job_search") 的 permission_denied 条目（admin 现可访问 job_search）
+
+v4 变更（方案一：意图按操作类型重构）：
+    - _ROLE_INTENT_WHITELIST：job_search/job_manage 合并为 job_query；
+                              candidate_search 改名为 candidate_query
+    - _PERMISSION_DENIED_MESSAGES：
+        · ("jobseeker", "candidate_search") → ("jobseeker", "candidate_query")，内容不变
+        · ("jobseeker", "job_manage") 删除（job_manage 已并入 job_query，
+          jobseeker 访问 job_query 会被分发到 job_search_agent，不存在越权）
+        · ("recruiter", "job_search") 删除（job_search 已并入 job_query，
+          recruiter 访问 job_query 会被分发到 job_manage_agent，不存在越权）
+    - _agent_map：
+        · "job_search"/"job_manage" 两个 key 替换为统一的 "job_query" → _call_job_query
+        · "candidate_search" key 改名为 "candidate_query"（方法体沿用 _call_candidate_search，逻辑不变）
+    - 新增 _call_job_query()：按角色分发到 job_search_agent（jobseeker）
+      或 job_manage_agent（recruiter 注入 company_id / admin 注入 tenant_id）
+    - 删除 _call_job_search()、_call_job_manage()、_call_job_manage_admin()，
+      三者逻辑完整搬迁进 _call_job_query()，无任何逻辑变更
+    - _call_candidate_search() / _call_candidate_search_admin() 方法名保留不变
+      （仅 agent_map 中的 key 改名为 candidate_query，避免无意义的大范围改名）
 """
 
 import logging
@@ -57,39 +76,34 @@ logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────
 # 权限控制常量（完整版，含 admin）
+# v4 变更：job_search/job_manage → job_query；candidate_search → candidate_query
 # ─────────────────────────────────────────────
 
 # admin 值为 None，表示不做意图拦截——所有意图均可访问。
-# admin 可以调用 job_search/job_manage/candidate_search 时，
+# admin 可以调用 job_query/candidate_query 时，
 # 控制器层在分发方法内注入 tenant_id 实现数据隔离（见各 _call_* 方法）。
 _ROLE_INTENT_WHITELIST: dict[str, set | None] = {
     "jobseeker": {
-        "resume_parse", "job_search", "knowledge", "chitchat", "unknown",
+        "resume_parse", "job_query", "knowledge", "chitchat", "unknown",
     },
     "recruiter": {
-        "resume_parse", "job_manage", "candidate_search", "knowledge", "chitchat", "unknown",
+        "resume_parse", "job_query", "candidate_query", "knowledge", "chitchat", "unknown",
     },
     "admin": None,  # None 表示不做意图拦截，所有意图均可访问（数据隔离由 tenant_id 保证）
 }
 
 _PERMISSION_DENIED_MESSAGES: dict = {
     # 求职者触发了招聘者功能
-    ("jobseeker", "candidate_search"): (
+    ("jobseeker", "candidate_query"): (
         "抱歉，候选人查询功能仅限招聘者使用。"
         "如需搜索职位，可以告诉我您的求职需求，例如城市、岗位或薪资要求 😊"
     ),
-    ("jobseeker", "job_manage"): (
-        "抱歉，职位管理功能仅限招聘者使用。"
-        "如需查找工作，可以直接告诉我您想找什么类型的职位。"
-    ),
-    # 招聘者触发了求职者功能
-    ("recruiter", "job_search"): (
-        "抱歉，您当前以招聘者身份登录，平台求职功能不对招聘者开放。"
-        "如需查看公司职位，请说'查看我们公司的职位'；"
-        "如需查看候选人，请告诉我职位名称。"
-    ),
+    # v4 说明：("jobseeker", "job_manage") 条目已删除。
+    # job_search 和 job_manage 合并为 job_query 后，jobseeker 访问 job_query
+    # 会被 _call_job_query() 分发到 job_search_agent（全平台搜索），不存在越权场景。
+    #
     # v3 说明：admin 白名单已改为 None（不拦截），("admin", "job_search") 条目已移除。
-    # admin 调用 job_search 时会走 _call_job_search() 的 admin 分支，注入 tenant_id。
+    # admin 调用 job_query 时会走 _call_job_query() 的 admin 分支，注入 tenant_id。
     # 通用兜底
     "default": "抱歉，您当前身份无权使用该功能，请确认操作是否正确。",
 }
@@ -104,6 +118,10 @@ class ChatController:
         - process_message() 读取并传递 prev_intent/prev_query，实现上下文路由
         - process_message() 路由完成后将本轮 intent/query 写回 session
         - admin 角色在 __init__() 阶段完成 tenant_id 鉴权
+
+    v4 变更：
+        - _agent_map 中 job_search/job_manage 合并为 job_query → _call_job_query()
+        - candidate_search 改名为 candidate_query（方法体仍是 _call_candidate_search）
     """
 
     def __init__(
@@ -137,11 +155,12 @@ class ChatController:
             enable_rule_router        = True,
         )
 
+        # v4：job_search / job_manage 合并为统一的 job_query 入口
+        #     candidate_search 改名为 candidate_query（方法体沿用 _call_candidate_search）
         self._agent_map = {
             "resume_parse":     self._call_resume,
-            "job_search":       self._call_job_search,
-            "job_manage":       self._call_job_manage,
-            "candidate_search": self._call_candidate_search,
+            "job_query":        self._call_job_query,
+            "candidate_query":  self._call_candidate_search,
             "platform_stats":   self._call_platform_stats,
             "knowledge":        self._call_knowledge,
             "chitchat":         self._call_chitchat,
@@ -409,95 +428,76 @@ class ChatController:
             "status": "success",
         }
 
-    def _call_job_search(self, query: str) -> dict:
+    def _call_job_query(self, query: str) -> dict:
         """
-        职位搜索分发：
-            jobseeker → 无 company_id / tenant_id 限制，搜索全平台公开职位
-            admin     → 注入 tenant_id，只搜索该租户下的公开职位（v3 新增）
-        """
-        history = self._get_history("job_search")
+        v4 新增：统一职位查询入口，按角色分发：
+            jobseeker → job_search_agent（无 company_id / tenant_id 限制，搜索全平台公开职位）
+            recruiter → job_manage_agent（注入 company_id，只能查本公司职位）
+            admin     → job_manage_agent（注入 tenant_id，可查租户下所有公司职位，
+                        覆盖原 platform_stats 中迁出的职位统计场景）
 
-        if self.user_role == "admin":
-            tenant_id = self._get_tenant_id()
-            if tenant_id is None:
-                return {
-                    "intent": "job_search",
-                    "data":   {"message": "管理员账号 tenant_id 获取失败，请联系系统管理员。"},
-                    "status": "error",
-                }
+        三段逻辑分别完整搬迁自原 _call_job_search()、_call_job_manage()、
+        _call_job_manage_admin()，无任何逻辑变更。
+        """
+        if self.user_role == "jobseeker":
+            # ── 原 _call_job_search() jobseeker 分支逻辑 ──────────
+            history  = self._get_history("job_search")
             response = job_search_agent.handle(
                 query      = query,
                 session_id = self.session_id,
+                history    = history,
+                llm        = self.supervisor.llm,
+            )
+            self._append_history("job_search", query, response["data"]["message"])
+            return response
+
+        elif self.user_role == "recruiter":
+            # ── 原 _call_job_manage() recruiter 分支逻辑 ──────────
+            company_id = self._get_company_id()
+            if company_id is None:
+                return {
+                    "intent": "job_query",
+                    "data":   {"message": "您的账号暂未关联企业信息，请联系管理员完成企业认证后再试。"},
+                    "status": "error",
+                }
+            history  = self._get_history("job_manage")
+            response = job_manage_agent.handle(
+                query      = query,
+                session_id = self.session_id,
+                company_id = company_id,
+                history    = history,
+                llm        = self.supervisor.llm,
+            )
+            self._append_history("job_manage", query, response["data"]["message"])
+            return response
+
+        else:
+            # ── 原 _call_job_manage_admin() 逻辑 ──────────────────
+            tenant_id = self._get_tenant_id()
+            if tenant_id is None:
+                return {
+                    "intent": "job_query",
+                    "data":   {"message": "管理员账号 tenant_id 获取失败，请联系系统管理员。"},
+                    "status": "error",
+                }
+            history  = self._get_history("job_manage")
+            response = job_manage_agent.handle(
+                query      = query,
+                session_id = self.session_id,
+                company_id = None,
                 tenant_id  = tenant_id,
                 history    = history,
                 llm        = self.supervisor.llm,
             )
-        else:
-            # jobseeker 原有逻辑：不传 tenant_id，搜索全平台
-            response = job_search_agent.handle(
-                query      = query,
-                session_id = self.session_id,
-                history    = history,
-                llm        = self.supervisor.llm,
-            )
-
-        self._append_history("job_search", query, response["data"]["message"])
-        return response
-
-    def _call_job_manage(self, query: str) -> dict:
-        """
-        职位管理分发：
-            recruiter → 注入 company_id（只能查本公司）
-            admin     → 注入 tenant_id（可查租户下所有公司）
-        """
-        if self.user_role == "admin":
-            return self._call_job_manage_admin(query)
-
-        # recruiter 原有逻辑
-        company_id = self._get_company_id()
-        if company_id is None:
-            return {
-                "intent": "job_manage",
-                "data":   {"message": "您的账号暂未关联企业信息，请联系管理员完成企业认证后再试。"},
-                "status": "error",
-            }
-        history  = self._get_history("job_manage")
-        response = job_manage_agent.handle(
-            query      = query,
-            session_id = self.session_id,
-            company_id = company_id,
-            history    = history,
-            llm        = self.supervisor.llm,
-        )
-        self._append_history("job_manage", query, response["data"]["message"])
-        return response
-
-    def _call_job_manage_admin(self, query: str) -> dict:
-        """admin 版职位管理：注入 tenant_id，不限 company_id"""
-        tenant_id = self._get_tenant_id()
-        if tenant_id is None:
-            return {
-                "intent": "job_manage",
-                "data":   {"message": "管理员账号 tenant_id 获取失败，请联系系统管理员。"},
-                "status": "error",
-            }
-        history  = self._get_history("job_manage")
-        response = job_manage_agent.handle(
-            query      = query,
-            session_id = self.session_id,
-            company_id = None,
-            tenant_id  = tenant_id,
-            history    = history,
-            llm        = self.supervisor.llm,
-        )
-        self._append_history("job_manage", query, response["data"]["message"])
-        return response
+            self._append_history("job_manage", query, response["data"]["message"])
+            return response
 
     def _call_candidate_search(self, query: str) -> dict:
         """
-        候选人查询分发：
+        候选人查询分发（v4：对应新意图名 candidate_query，方法名保留不变）：
             recruiter → 注入 company_id（只能查本公司候选人）
-            admin     → 注入 tenant_id（可查租户下所有候选人）
+            admin     → 注入 tenant_id（可查租户下所有候选人，
+                        覆盖原 platform_stats 中迁出的报名统计场景）
         """
         if self.user_role == "admin":
             return self._call_candidate_search_admin(query)
@@ -506,7 +506,7 @@ class ChatController:
         company_id = self._get_company_id()
         if company_id is None:
             return {
-                "intent": "candidate_search",
+                "intent": "candidate_query",
                 "data":   {"message": "您的账号暂未关联企业信息，请联系管理员完成企业认证后再试。"},
                 "status": "error",
             }
@@ -526,7 +526,7 @@ class ChatController:
         tenant_id = self._get_tenant_id()
         if tenant_id is None:
             return {
-                "intent": "candidate_search",
+                "intent": "candidate_query",
                 "data":   {"message": "管理员账号 tenant_id 获取失败，请联系系统管理员。"},
                 "status": "error",
             }
@@ -546,6 +546,8 @@ class ChatController:
         """
         平台统计（admin 专属）。
         调用 platform_stats_agent，传入 tenant_id。
+        v4：platform_stats_agent 职责已缩减为纯企业统计 + 复杂分析，
+            职位/候选人统计由 job_query / candidate_query 的 admin 分支承接。
         """
         tenant_id = self._get_tenant_id()
         if tenant_id is None:

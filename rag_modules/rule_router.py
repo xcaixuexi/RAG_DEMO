@@ -4,25 +4,26 @@ rule_router.py — 基于关键词/正则的规则快速路由层
 路由优先级（从高到低）：
     1. 否定保护 (NegationGuard)  — 含"不要/别/取消"等否定词时直接放行给 LLM
     2. resume_parse              — 简历解析类
-    3. candidate_search          — 招聘者查询候选人（原 job_match 招聘侧）
-    4. job_search                — 求职者搜索公开职位（原 job_match 求职侧）
-    5. platform_stats            — 平台管理员统计查询（v2 调整：移至 job_manage 前，防止"发布了多少职位"被抢走）
-    6. job_manage                — 招聘者管理自己公司职位
-    7. knowledge                 — 招聘知识/流程/法规类
-    8. chitchat                  — 闲聊/问候类
+    3. candidate_query           — 招聘者查询候选人（原 candidate_search 改名）
+    4. job_query                 — 职位查询（合并自 job_search + job_manage）
+    5. platform_stats            — 平台管理员统计查询（v3 精简：只保留企业/平台相关触发词）
+    6. knowledge                 — 招聘知识/流程/法规类
+    7. chitchat                  — 闲聊/问候类
     返回 None 表示规则未命中，交由 LLM 处理。
 
-注意：规则层不感知 user_role，角色权限校验由控制器层统一处理。
+v2 调整：
+    - platform_stats 移至 job_manage 前，防止"发布了多少职位"被抢走
 
-v3（消歧补丁）变更：
-    - _PLATFORM_STATS_KEYWORDS 移除与 job_manage 高度重叠的歧义词
-    - _JOB_MANAGE_KEYWORDS 接收迁移来的歧义词（有公司归属上下文时命中 job_manage）
-    - 新增 _COMPANY_SCOPE_SIGNALS：公司归属词，触发 platform_stats → job_manage 降级
-    - 新增 _CANDIDATE_SCOPE_SIGNALS：候选人归属词，触发 platform_stats → candidate_search 降级
-    - 新增 _PLATFORM_SCOPE_SIGNALS：平台专属词，用于 candidate_search 正则优先的反向保护
-    - 新增 _disambiguate()：对 platform_stats 命中结果做消歧，按优先级降级
-    - route() 中 platform_stats 命中后调用 _disambiguate() 再返回
-    - route() 中 candidate_search 正则优先命中后加反向保护：同时含平台级词则放行给 LLM
+v3 变更（方案一）：
+    - job_search 和 job_manage 合并为 job_query（关键词/正则/精确映射全部合并）
+    - candidate_search 改名为 candidate_query（关键词/正则/精确映射同步更新）
+    - platform_stats 触发词精简：删除职位/候选人统计相关词，只保留企业/平台相关词
+      删除：发布了多少、多少个职位、多少个在招、发布了多少个、多少个发布、在招的有多少
+            各城市职位、城市分布、报名总数、有多少人报名等
+    - 路由打分顺序调整：candidate_query 正则优先检测移到打分循环前（保持原逻辑）
+    - platform_stats 在打分循环中仍排在 job_query 前（防止企业统计词被抢走）
+
+注意：规则层不感知 user_role，角色权限校验由控制器层统一处理。
 """
 
 import re
@@ -75,7 +76,6 @@ _NEGATION_WORDS: list[str] = [
 # ── resume_parse ──────────────────────────────
 _RESUME_KEYWORDS: list[str] = [
     "简历", "履历", "cv", "resume",
-    "求职者", "候选人信息", "应聘者",
     "工作经历", "项目经历", "教育背景", "技能栈",
     "解析", "提取信息", "分析简历", "看简历", "读简历",
     "简历评分", "简历优化", "简历建议",
@@ -89,15 +89,25 @@ _RESUME_PATTERNS: list[re.Pattern] = [
     re.compile(r"(上传|发送|给你).{0,6}简历"),
 ]
 
-# ── job_search（求职者搜索公开职位）──────────
-_JOB_SEARCH_KEYWORDS: list[str] = [
+# ── job_query（合并自 job_search + job_manage）──
+# v3 新增：将原 _JOB_SEARCH_KEYWORDS/_JOB_SEARCH_PATTERNS 和
+#          _JOB_MANAGE_KEYWORDS/_JOB_MANAGE_PATTERNS 合并为统一的 job_query 组
+_JOB_QUERY_KEYWORDS: list[str] = [
+    # 原 job_search 侧（求职者搜索）
     "找工作", "找职位", "找岗位", "求职", "应聘", "投简历",
     "有没有职位", "推荐职位", "招聘信息", "在招",
     "招前端", "招后端", "招开发", "招运营", "招设计", "招产品", "招销售",
     "我想找", "想应聘", "帮我找工作",
+    # 原 job_manage 侧（招聘者管理）
+    "我们公司", "公司职位", "公司岗位", "公司在招", "发布的职位",
+    "发布的岗位", "我发布", "我们发布", "公司有多少职位",
+    "查看职位", "管理职位", "职位列表",
+    # 通用
+    "有哪些职位", "职位情况", "在招职位", "职位总数", "发布了多少职位",
 ]
 
-_JOB_SEARCH_PATTERNS: list[re.Pattern] = [
+_JOB_QUERY_PATTERNS: list[re.Pattern] = [
+    # 原 job_search 侧正则
     re.compile(
         r"(找|推荐|有没有).{0,10}"
         r"(工程师|开发|产品经理|运营|设计师|销售|测试|数据|算法|前端|后端|全栈)"
@@ -107,27 +117,17 @@ _JOB_SEARCH_PATTERNS: list[re.Pattern] = [
     re.compile(r"(想找|要找|想应聘).{0,15}(工作|职位|岗位)"),
     re.compile(r"(深圳|上海|北京|广州|东莞|杭州|成都|武汉|西安|南京).{0,10}(职位|岗位|工作)"),
     re.compile(r"(全职|兼职|实习|临时工).{0,6}(职位|岗位|工作|推荐)"),
-]
-
-# ── job_manage（招聘者管理自己公司职位）───────
-_JOB_MANAGE_KEYWORDS: list[str] = [
-    "我们公司", "公司职位", "公司岗位", "公司在招", "发布的职位",
-    "发布的岗位", "我发布", "我们发布", "公司有多少职位",
-    "查看职位", "管理职位", "职位列表",
-    # v3 新增：从 _PLATFORM_STATS_KEYWORDS 迁移，有公司归属上下文时命中 job_manage
-    "公司有多少岗位",
-    "发布了多少职位",
-]
-
-_JOB_MANAGE_PATTERNS: list[re.Pattern] = [
+    # 原 job_manage 侧正则
     re.compile(r"(我们|我|本)公司.{0,10}(职位|岗位|在招|发布)"),
     re.compile(r"(查看|查询|看看).{0,6}(公司|我们).{0,6}(职位|岗位)"),
     re.compile(r"公司.{0,6}(有多少|有哪些|在招).{0,6}(职位|岗位|工作)"),
     re.compile(r"(发布|上线).{0,6}(职位|岗位).{0,6}(列表|情况|状态)"),
 ]
 
-# ── candidate_search（招聘者查询候选人）───────
-_CANDIDATE_SEARCH_KEYWORDS: list[str] = [
+# ── candidate_query（原 candidate_search 改名）──
+# v3 改名：_CANDIDATE_SEARCH_KEYWORDS/_CANDIDATE_SEARCH_PATTERNS
+#          → _CANDIDATE_QUERY_KEYWORDS/_CANDIDATE_QUERY_PATTERNS
+_CANDIDATE_QUERY_KEYWORDS: list[str] = [
     # 查询已有数据类
     "候选人", "报名情况", "报名人员", "应聘者", "找候选人",
     "筛选简历", "匹配候选人", "推荐人才", "查报名", "有多少人报名",
@@ -137,7 +137,7 @@ _CANDIDATE_SEARCH_KEYWORDS: list[str] = [
     "需要招", "急招", "招人", "找人才",
 ]
 
-_CANDIDATE_SEARCH_PATTERNS: list[re.Pattern] = [
+_CANDIDATE_QUERY_PATTERNS: list[re.Pattern] = [
     # 查询已有数据类
     re.compile(r"(查看|查询|有多少).{0,10}(候选人|报名|应聘者)"),
     re.compile(r"(筛选|过滤|审核).{0,6}(简历|候选人)"),
@@ -151,25 +151,29 @@ _CANDIDATE_SEARCH_PATTERNS: list[re.Pattern] = [
     re.compile(r"(岗位|职位).{0,10}(要求|条件|经验|学历).{0,10}(推荐|匹配|有没有)"),
 ]
 
-# ── platform_stats（平台管理员统计查询）───────
-# v3 变更：移除与 job_manage 高度重叠的歧义词，只保留平台专属词
+# ── platform_stats（v3 精简：只保留企业/平台相关词，删除职位/候选人统计词）──
 _PLATFORM_STATS_KEYWORDS: list[str] = [
     "平台", "租户", "所有企业", "所有公司", "全平台",
-    "企业总数", "公司总数", "职位总数", "岗位总数", "报名总数",
-    "统计", "数据概览", "分布情况", "待审核企业", "待审核职位",
-    "各城市", "各行业", "新增企业", "新增职位",
-    # v3 已移除以下歧义词（原本在此，现迁移到 _JOB_MANAGE_KEYWORDS 或依靠消歧逻辑处理）：
-    # "发布了多少", "多少个职位", "多少个在招", "发布的职位",
-    # "多少家", "共有多少", "一共多少",
+    "企业总数", "公司总数", "多少企业", "多少公司",
+    "统计", "数据概览", "待审核企业", "待审核公司",
+    "各行业", "新增企业",
+    # v3 说明：删除以下词（迁移至 job_query / candidate_query）：
+    #   "职位总数", "岗位总数", "报名总数", "发布了多少", "多少个职位",
+    #   "多少个在招", "发布的职位", "多少个发布", "在职的有多少",
+    #   "各城市", "城市分布", "按城市", "有多少人报名"
 ]
 
 _PLATFORM_STATS_PATTERNS: list[re.Pattern] = [
     re.compile(r"(平台|租户).{0,10}(有多少|总数|统计|概览)"),
-    re.compile(r"(有多少家|多少个).{0,6}(企业|公司|职位|岗位)"),
-    re.compile(r"(企业|公司|职位|报名).{0,6}(分布|统计|总数|数量)"),
-    re.compile(r"(各城市|各行业|按城市|按行业).{0,10}(职位|企业|统计)"),
-    re.compile(r"(待审核|未审核).{0,6}(企业|职位|候选人)"),
-    re.compile(r"(今天|本周|本月|最近).{0,10}(新增|注册|发布|报名)"),
+    re.compile(r"(有多少家|多少).{0,6}(企业|公司)"),
+    re.compile(r"(企业|公司).{0,6}(分布|统计|总数|数量)"),
+    re.compile(r"(各行业|按行业).{0,10}(企业|统计)"),
+    re.compile(r"(待审核|未审核).{0,6}(企业|公司)"),
+    re.compile(r"(今天|本周|本月|最近).{0,10}(新增|注册).{0,6}(企业|公司)"),
+    # v3 说明：删除以下正则（迁移至 job_query / candidate_query）：
+    #   r"(各城市|各行业|按城市|按行业).{0,10}(职位|企业|统计)"
+    #   r"(待审核|未审核).{0,6}(职位|候选人)"
+    #   r"(今天|本周|本月|最近).{0,10}(新增|注册|发布|报名)"
 ]
 
 # ── knowledge ─────────────────────────────────
@@ -216,6 +220,10 @@ _CHITCHAT_PATTERNS: list[re.Pattern] = [
 ]
 
 # ── 精确短句映射（最高优先级）──────────────────
+# v3 变更：
+#   - 删除 "找工作": "job_search"、"找职位": "job_search" 等旧 job_search/job_manage 映射
+#   - 统一改为 job_query
+#   - candidate_search 系列改为 candidate_query
 _EXACT_MAP: dict[str, Intent] = {
     # resume_parse
     "解析简历":     "resume_parse",
@@ -224,27 +232,26 @@ _EXACT_MAP: dict[str, Intent] = {
     "提取简历信息": "resume_parse",
     "简历分析":     "resume_parse",
     "简历解析":     "resume_parse",
-    # job_search
-    "找工作":       "job_search",
-    "找职位":       "job_search",
-    "推荐岗位":     "job_search",
-    # job_manage
-    "公司职位":     "job_manage",
-    "我们公司职位": "job_manage",
-    "查看职位":     "job_manage",
-    "职位列表":     "job_manage",
-    # candidate_search
-    "匹配候选人":   "candidate_search",
-    "推荐人才":     "candidate_search",
-    "找候选人":     "candidate_search",
-    "筛选简历":     "candidate_search",
-    "招聘匹配":     "candidate_search",
+    # job_query（合并自 job_search + job_manage）
+    "找工作":       "job_query",
+    "找职位":       "job_query",
+    "推荐岗位":     "job_query",
+    "公司职位":     "job_query",
+    "我们公司职位": "job_query",
+    "查看职位":     "job_query",
+    "职位列表":     "job_query",
+    # candidate_query（原 candidate_search 改名）
+    "匹配候选人":   "candidate_query",
+    "推荐人才":     "candidate_query",
+    "找候选人":     "candidate_query",
+    "筛选简历":     "candidate_query",
+    "招聘匹配":     "candidate_query",
     # platform_stats
     "企业总数":     "platform_stats",
-    "职位总数":     "platform_stats",
     "平台统计":     "platform_stats",
-    "报名总数":     "platform_stats",
     "数据概览":     "platform_stats",
+    # v3 删除："职位总数": "platform_stats"、"报名总数": "platform_stats"
+    # 这两个词迁移到 job_query / candidate_query
     # chitchat
     "你好":   "chitchat",
     "hi":     "chitchat",
@@ -255,33 +262,6 @@ _EXACT_MAP: dict[str, Intent] = {
     "再见":   "chitchat",
     "拜拜":   "chitchat",
 }
-
-
-# ─────────────────────────────────────────────
-# 消歧信号词（v3 新增）
-# ─────────────────────────────────────────────
-
-# 公司归属词：含这些词时，说明用户在询问"本公司"的数据，
-# 应从 platform_stats 降级为 job_manage
-_COMPANY_SCOPE_SIGNALS: list[str] = [
-    "我们公司", "本公司", "公司发布", "公司职位",
-    "公司岗位", "公司在招", "我发布的", "我们发布",
-]
-
-# 候选人归属词：含这些词时，说明用户在询问某具体职位的报名情况，
-# 应从 platform_stats 降级为 candidate_search
-_CANDIDATE_SCOPE_SIGNALS: list[str] = [
-    "有多少人报名", "报名了多少", "职位报名",
-    "候选人有多少", "报名人数", "多少人投了",
-]
-
-# 平台专属词：用于 candidate_search 正则优先检测的反向保护。
-# 命中 candidate_search 正则但同时含有这些词时，说明意图模糊，
-# 放行给 LLM 处理（返回 None）
-_PLATFORM_SCOPE_SIGNALS: list[str] = [
-    "所有企业", "所有公司", "全平台", "平台统计",
-    "各城市", "各行业", "租户", "数据概览",
-]
 
 
 # ─────────────────────────────────────────────
@@ -299,9 +279,11 @@ class RuleRouter:
         每个意图通过"关键词命中数 + 正则命中数"累加得分，
         只有得分 ≥ confidence_threshold 才认为命中，防止单词误判。
 
-    v3 消歧补丁：
-        platform_stats 命中后调用 _disambiguate() 尝试降级；
-        candidate_search 正则优先命中后加反向保护防止误抢平台级查询。
+    v3 变更：
+        - 打分循环中 job_search + job_manage → job_query（合并）
+        - candidate_search → candidate_query（改名）
+        - candidate_query 正则优先检测保持不变（防止"招人"类被 job_query 抢走）
+        - platform_stats 仍排在 job_query 前（防止企业统计词被抢走）
     """
 
     def __init__(self, confidence_threshold: int = 1):
@@ -313,13 +295,11 @@ class RuleRouter:
         """
         self.confidence_threshold = confidence_threshold
         logger.info(f"RuleRouter 初始化完成，置信度阈值={confidence_threshold}")
-
-    # ── 公开接口 ──────────────────────────────
+        # ── 公开接口 ──────────────────────────────
 
     def route(self, query: str) -> Optional[Intent]:
         """
         尝试对 query 进行规则路由。
-
         Args:
             query: 原始用户输入
 
@@ -339,45 +319,29 @@ class RuleRouter:
             logger.debug(f"[规则路由] 含否定词，放行给 LLM: '{query}'")
             return None
 
-        # 2. candidate_search 正则优先（防止"筛选简历"被 resume_parse 关键词抢走）
-        #    v3 新增反向保护：同时含平台专属词时，意图模糊，放行给 LLM
-        if _match_any_pattern(text, _CANDIDATE_SEARCH_PATTERNS):
-            if _any_keyword(text, _PLATFORM_SCOPE_SIGNALS):
-                # 同时命中 candidate_search 正则和平台专属词，意图不明确，交 LLM 处理
-                logger.debug(
-                    f"[规则路由] candidate_search 正则命中但含平台专属词，"
-                    f"放行给 LLM: '{query}'"
-                )
-                return None
+        # 2. candidate_query 正则优先（防止"筛选简历"被 resume_parse 关键词抢走）
+        if _match_any_pattern(text, _CANDIDATE_QUERY_PATTERNS):
             if not _match_any_pattern(text, _CHITCHAT_PATTERNS):
-                logger.info(f"[规则路由] candidate_search 正则优先命中 '{query}'")
-                return "candidate_search"
+                logger.info(f"[规则路由] candidate_query 正则优先命中 '{query}'")
+                return "candidate_query"
 
         # 3. 按意图顺序打分
-        # 打分顺序：resume_parse → candidate_search → job_search
-        #           → platform_stats → job_manage → knowledge → chitchat
-        # v2 调整：platform_stats 移到 job_manage 前，
-        #          防止"发布了多少职位"被 job_manage 的"发布的职位"关键词抢走
-        # v3 调整：platform_stats 命中后调用 _disambiguate() 尝试降级
+        # 打分顺序：resume_parse → candidate_query → job_query
+        #           → platform_stats → knowledge → chitchat
+        # v3 调整：
+        #   - platform_stats 排在 job_query 前（防止"有多少家企业"被 job_query 抢走）
+        #   - job_search + job_manage 合并为 job_query
+        #   - candidate_search 改名为 candidate_query
         for intent_label, kw_list, pat_list in [
-            ("platform_stats",   _PLATFORM_STATS_KEYWORDS,   _PLATFORM_STATS_PATTERNS),    # v2 调整：移至 job_manage 前
-            ("resume_parse",     _RESUME_KEYWORDS,           _RESUME_PATTERNS),
-            ("candidate_search", _CANDIDATE_SEARCH_KEYWORDS, _CANDIDATE_SEARCH_PATTERNS),  # 提前，避免"招人"类被 job_search 抢走
-            ("job_search",       _JOB_SEARCH_KEYWORDS,       _JOB_SEARCH_PATTERNS),
-            ("job_manage",       _JOB_MANAGE_KEYWORDS,       _JOB_MANAGE_PATTERNS),
-            ("knowledge",        _KNOWLEDGE_KEYWORDS,        _KNOWLEDGE_PATTERNS),
-            ("chitchat",         _CHITCHAT_KEYWORDS,         _CHITCHAT_PATTERNS),
+            ("platform_stats",  _PLATFORM_STATS_KEYWORDS,  _PLATFORM_STATS_PATTERNS),
+            ("resume_parse",    _RESUME_KEYWORDS,           _RESUME_PATTERNS),
+            ("candidate_query", _CANDIDATE_QUERY_KEYWORDS,  _CANDIDATE_QUERY_PATTERNS),
+            ("job_query",       _JOB_QUERY_KEYWORDS,        _JOB_QUERY_PATTERNS),
+            ("knowledge",       _KNOWLEDGE_KEYWORDS,        _KNOWLEDGE_PATTERNS),
+            ("chitchat",        _CHITCHAT_KEYWORDS,         _CHITCHAT_PATTERNS),
         ]:
             score = self._score(text, kw_list, pat_list)
             if score >= self.confidence_threshold:
-                if intent_label == "platform_stats":
-                    # v3 消歧：platform_stats 命中后尝试降级
-                    disambiguated = self._disambiguate(text)
-                    logger.info(
-                        f"[规则路由] platform_stats 消歧: '{query}' → {disambiguated} "
-                        f"(score={score})"
-                    )
-                    return disambiguated  # type: ignore
                 logger.info(f"[规则路由] 命中 '{query}' → {intent_label} (score={score})")
                 return intent_label  # type: ignore
 
@@ -391,13 +355,12 @@ class RuleRouter:
         scores = {}
         # explain() 的打分顺序与 route() 保持一致
         for label, kw_list, pat_list in [
-            ("platform_stats",   _PLATFORM_STATS_KEYWORDS,   _PLATFORM_STATS_PATTERNS),    # v2 调整：移至 job_manage 前
-            ("resume_parse",     _RESUME_KEYWORDS,           _RESUME_PATTERNS),
-            ("candidate_search", _CANDIDATE_SEARCH_KEYWORDS, _CANDIDATE_SEARCH_PATTERNS),
-            ("job_search",       _JOB_SEARCH_KEYWORDS,       _JOB_SEARCH_PATTERNS),
-            ("job_manage",       _JOB_MANAGE_KEYWORDS,       _JOB_MANAGE_PATTERNS),
-            ("knowledge",        _KNOWLEDGE_KEYWORDS,        _KNOWLEDGE_PATTERNS),
-            ("chitchat",         _CHITCHAT_KEYWORDS,         _CHITCHAT_PATTERNS),
+            ("platform_stats",  _PLATFORM_STATS_KEYWORDS,  _PLATFORM_STATS_PATTERNS),
+            ("resume_parse",    _RESUME_KEYWORDS,           _RESUME_PATTERNS),
+            ("candidate_query", _CANDIDATE_QUERY_KEYWORDS,  _CANDIDATE_QUERY_PATTERNS),
+            ("job_query",       _JOB_QUERY_KEYWORDS,        _JOB_QUERY_PATTERNS),
+            ("knowledge",       _KNOWLEDGE_KEYWORDS,        _KNOWLEDGE_PATTERNS),
+            ("chitchat",        _CHITCHAT_KEYWORDS,         _CHITCHAT_PATTERNS),
         ]:
             scores[label] = self._score(text, kw_list, pat_list)
 
@@ -410,35 +373,6 @@ class RuleRouter:
         }
 
     # ── 私有方法 ──────────────────────────────
-
-    def _disambiguate(self, text: str) -> Intent:
-        """
-        消歧方法（v3 新增）：对打分循环命中 platform_stats 的输入做二次判断，
-        按优先级尝试降级到更精确的意图。
-
-        消歧优先级（从高到低）：
-            1. 含公司归属词（_COMPANY_SCOPE_SIGNALS）→ 降级为 job_manage
-            2. 含候选人归属词（_CANDIDATE_SCOPE_SIGNALS）→ 降级为 candidate_search
-            3. 无上述信号词 → 保持 platform_stats
-
-        Args:
-            text: 已归一化（小写）的用户输入
-
-        Returns:
-            消歧后的 Intent
-        """
-        # 优先级 1：含公司归属词 → 是招聘者在查自己公司的数据
-        if _any_keyword(text, _COMPANY_SCOPE_SIGNALS):
-            logger.info(f"[消歧] 含公司归属词，platform_stats → job_manage: '{text}'")
-            return "job_manage"
-
-        # 优先级 2：含候选人归属词 → 是招聘者在查具体职位的报名情况
-        if _any_keyword(text, _CANDIDATE_SCOPE_SIGNALS):
-            logger.info(f"[消歧] 含候选人归属词，platform_stats → candidate_search: '{text}'")
-            return "candidate_search"
-
-        # 无上述信号词 → 保持 platform_stats（真正的平台级查询）
-        return "platform_stats"
 
     def _exact_match(self, text: str) -> Optional[Intent]:
         """精确短句映射，text 已归一化小写"""

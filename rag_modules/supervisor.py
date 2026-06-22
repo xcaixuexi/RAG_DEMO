@@ -12,9 +12,17 @@ v2 变更：
     - LLM Router Prompt 新增第 8 个意图说明
     - 全局优先规则新增 P5：含跨公司聚合词时优先 platform_stats
 
-v3（消歧补丁）变更：
-    - platform_stats 意图说明末尾新增边界排除示例，防止 LLM 误判
-    - 全局优先规则 P5 收紧：含公司归属词时不触发 platform_stats
+v3 变更（方案一）：
+    - Intent 类型：删除 job_search、job_manage，新增 job_query；
+                   candidate_search 改名为 candidate_query
+    - _VALID_INTENTS 集合同步更新
+    - LLM Router Prompt 意图说明重写：
+        · 删除原第2条（job_search）和第3条（job_manage）
+        · 新增一条 job_query（覆盖求职/招聘/admin 三个视角）
+        · 第4条 candidate_search 改名为 candidate_query，内容不变
+        · platform_stats 说明末尾补充排除示例
+    - 全局优先规则 P1/P2 适配新意图名；P5 收窄为纯企业/平台词
+    - 上下文继承示例中 job_search/candidate_search 改为 job_query/candidate_query
 """
 
 import logging
@@ -31,29 +39,25 @@ from utils.timer import timed
 
 logger = logging.getLogger(__name__)
 
-# 意图类型定义
+# 意图类型定义（v3：job_search + job_manage → job_query；candidate_search → candidate_query）
 Intent = Literal[
     "resume_parse",
-    "job_search",        # 求职者搜索平台公开职位
-    "job_manage",        # 招聘者查看/管理自己公司职位
-    "candidate_search",  # 招聘者查询候选人和报名情况
-    "platform_stats",    # 平台管理员专属统计查询（新增）
+    "job_query",         # 职位查询（合并自 job_search + job_manage）
+    "candidate_query",   # 候选人查询（原 candidate_search 改名）
+    "platform_stats",    # 平台管理员专属统计查询
     "knowledge",
     "chitchat",
     "unknown",
 ]
 
 _VALID_INTENTS = {
-    "resume_parse", "job_search", "job_manage",
-    "candidate_search", "platform_stats", "knowledge", "chitchat",
+    "resume_parse", "job_query", "candidate_query",
+    "platform_stats", "knowledge", "chitchat",
 }
 
 
 # ─────────────────────────────────────────────
-# 路由 Prompt（结构化重写）
-# v3 变更：
-#   - platform_stats 说明末尾新增【边界排除规则】
-#   - 全局优先规则 P5 收紧，加入"不含公司归属词"限制
+# 路由 Prompt（v3 重写）
 # ─────────────────────────────────────────────
 
 _ROUTER_PROMPT_TEMPLATE = """\
@@ -66,13 +70,14 @@ _ROUTER_PROMPT_TEMPLATE = """\
 ═══════════════════════════════════════════════
 
 【全局优先规则 — 先判断再看详细说明】
-P1. 含"招/招聘/招募/招一个/帮我招/我想招" → 优先 candidate_search（招聘者视角）
-P2. 含"找工作/找职位/想应聘/投简历/求职" → 优先 job_search（求职者视角）
+P1. 含"招/招聘/招募/招一个/帮我招/我想招" → 优先 candidate_query（招聘者视角）
+P2. 含"找工作/找职位/想应聘/投简历/求职/我们公司职位/公司发布" → 优先 job_query
 P3. 含"简历/cv/履历" + 操作动词 → 优先 resume_parse
 P4. 当前输入 ≤8字 且为省略句/指代（"深圳的呢"/"还有吗"/"那个职位"）
     → 继承上一轮意图（prev_intent），不要输出 unknown
-P5. 含"所有企业/所有公司/全平台/平台统计/租户统计"等跨公司聚合词，
-    且不含"我们公司/本公司/公司职位/公司发布"等公司归属词 → 优先 platform_stats
+P5. 含"所有企业/所有公司/全平台/平台统计/租户统计/待审核企业/企业总数"等
+    纯企业/平台聚合词 → 优先 platform_stats
+    注意：含"职位/候选人/报名"的统计需求归入 job_query 或 candidate_query，不归 platform_stats
 
 ═══════════════════════════════════════════════
 【意图详细说明】
@@ -84,39 +89,36 @@ P5. 含"所有企业/所有公司/全平台/平台统计/租户统计"等跨公�
    ✓ "帮我分析这份简历"
    ✓ "这份cv怎么样"
    ✓ "提取候选人的工作经历"
-   ✗ "找简历" → candidate_search（找人不是解析简历）
+   ✗ "找简历" → candidate_query（找人不是解析简历）
 
-2. job_search — 求职者在平台搜索公开职位
-   触发词：找工作、找职位、想应聘、投简历、有哪些岗位、推荐职位
+2. job_query — 职位查询（求职者搜索公开职位 / 招聘者管理本公司职位 / admin 查租户职位）
+   触发词（求职侧）：找工作、找职位、找岗位、求职、应聘、投简历、有没有职位、推荐职位
+   触发词（招聘侧）：我们公司、公司职位、公司岗位、公司在招、发布的职位、查看职位、职位列表
+   触发词（通用）：有哪些职位、在招职位、职位总数、发布了多少职位
    示例：
-   ✓ "深圳有没有Python开发的职位"
-   ✓ "我想找一份月薪15k以上的产品经理岗位"
-   ✓ "推荐一些上海的前端职位"
-   ✓ "有没有临时工岗位"
-   ✗ "帮我招一个前端" → candidate_search
+   ✓ "深圳有没有Python开发的职位"         → job_query（求职者搜索）
+   ✓ "我想找一份月薪15k以上的产品经理岗位" → job_query（求职者搜索）
+   ✓ "我们公司现在有哪些在招职位"          → job_query（招聘者管理）
+   ✓ "公司发布了多少个岗位"               → job_query（招聘者管理）
+   ✓ "在招职位有多少个"                   → job_query（admin 统计）
+   ✓ "各城市职位分布情况"                 → job_query（admin 统计）
+   ✓ "待审核的职位有几个"                 → job_query（admin 统计）
+   ✗ "帮我招一个前端" → candidate_query（招人≠查职位）
+   ✗ "多少企业发布了职位" → platform_stats（企业统计不是职位统计）
 
-3. job_manage — 招聘者查看/管理本公司职位
-   触发词：我们公司、公司发布的、公司职位、公司岗位、管理职位
-   示例：
-   ✓ "我们公司现在有哪些在招职位"
-   ✓ "公司发布了多少个岗位"
-   ✓ "查看我们公司停止发布的职位"
-   ✓ "我们公司发布了多少职位"
-   ✓ "公司有多少个在招岗位"
-   ✗ "查所有职位" → 角色不明确时倾向 job_search
-
-4. candidate_search — 招聘者查询候选人/描述岗位需求找人
-   触发词：招、招聘、招募、候选人、报名情况、筛选简历、找人才、帮我招
+3. candidate_query — 候选人查询（招聘者查询候选人/描述岗位需求找人）
+   触发词：招、招聘、招募、候选人、报名情况、筛选简历、匹配候选人、推荐人才、查报名
+           帮我招、我想招、招一个、招聘一个、找人才
    示例：
    ✓ "帮我招一个3年经验的Java后端"
    ✓ "产品经理职位有多少人报名"
    ✓ "帮我筛选一下候选人"
    ✓ "我想招一个做运营的"
-   ✓ "找一个有销售经验的人"
-   ✓ "产品经理职位报名了多少人"
-   ✗ "我想找一份销售工作" → job_search（我=求职者）
+   ✓ "平台总报名数是多少"                 → candidate_query（报名统计）
+   ✓ "目前在职员工有多少"                 → candidate_query（在职统计）
+   ✗ "我想找一份销售工作" → job_query（我=求职者）
 
-5. knowledge — 招聘知识/法规/流程问答
+4. knowledge — 招聘知识/法规/流程问答
    触发词：如何、怎么、注意事项、劳动法、试用期、offer、薪酬、面试技巧、JD
    示例：
    ✓ "面试时要注意什么"
@@ -124,42 +126,41 @@ P5. 含"所有企业/所有公司/全平台/平台统计/租户统计"等跨公�
    ✓ "如何写招聘JD"
    ✓ "薪酬谈判有什么技巧"
 
-6. chitchat — 日常问候/闲聊（与招聘无关）
+5. chitchat — 日常问候/闲聊（与招聘无关）
    示例：
    ✓ "你好"
    ✓ "今天天气怎么样"
    ✓ "你叫什么名字"
 
-7. unknown — 真正无法归类时使用（慎用，优先继承上下文）
+6. unknown — 真正无法归类时使用（慎用，优先继承上下文）
 
-8. platform_stats — 平台级统计查询（仅 admin 可用）
-   触发词：平台、所有企业、全平台、总数、统计、分布、各城市、各行业、待审核
+7. platform_stats — 平台级企业统计查询（仅 admin 可用）
+   触发词：平台、所有企业、全平台、企业总数、公司总数、统计、数据概览
+           各行业企业、待审核企业、新增企业、按行业分布
    示例：
    ✓ "现在有多少家企业"
-   ✓ "平台今天新增了多少职位"
-   ✓ "各城市职位分布情况"
+   ✓ "各行业企业分布情况"
    ✓ "待审核的企业有几家"
-   ✓ "全平台在招职位有多少"
-   ✓ "所有企业的行业分布"
-
-   【边界排除规则】
-   以下场景含有公司归属词或职位级报名词，不属于平台聚合统计，请勿归为 platform_stats：
-   ✗ "我们公司有多少职位" → job_manage（含"我们公司"，是招聘者查本公司，不是全平台）
-   ✗ "产品经理职位报名了多少人" → candidate_search（针对具体职位的报名查询，不是平台总数）
-   ✗ "公司发布了多少岗位" → job_manage（有公司归属，非平台聚合）
-   ✗ "本公司在招职位数量" → job_manage（本公司视角，非平台视角）
+   ✓ "全平台企业总数"
+   ✓ "有多少家企业发布职位"（统计发布职位的企业数量，非职位数量）
+   ✗ "在招职位有多少个" → job_query（职位统计，不是企业统计）
+   ✗ "总报名人数是多少" → candidate_query（报名统计，不是企业统计）
+   ✗ "我们公司有多少职位" → job_query（有"我们公司"，是招聘者视角）
 
 ═══════════════════════════════════════════════
 【上下文继承示例】
 ═══════════════════════════════════════════════
-prev_intent=job_search, prev_query="深圳有Python职位吗"
-current="上海的呢" → job_search（继承，换城市追问）
+prev_intent=job_query, prev_query="深圳有Python职位吗"
+current="上海的呢" → job_query（继承，换城市追问）
 
-prev_intent=candidate_search, prev_query="产品经理有多少候选人"
-current="前端的呢" → candidate_search（继承，换岗位追问）
+prev_intent=candidate_query, prev_query="产品经理有多少候选人"
+current="前端的呢" → candidate_query（继承，换岗位追问）
 
 prev_intent=knowledge, prev_query="试用期有什么规定"
 current="那离职呢" → knowledge（继承，话题延伸）
+
+prev_intent=job_query, prev_query="我们公司在招什么职位"
+current="有多少个" → job_query（继承，追问数量）
 
 ═══════════════════════════════════════════════
 【置信度说明】
@@ -192,6 +193,10 @@ class Supervisor:
     上下文感知路由：
         route() 接受 prev_intent / prev_query 参数，
         解决"深圳的呢"/"还有吗"等省略句的意图继承问题。
+
+    v3 变更：
+        - Intent 类型更新（job_query 合并；candidate_query 改名）
+        - LLM Router Prompt 重写
     """
 
     _instance: Optional["Supervisor"] = None
@@ -370,9 +375,9 @@ class Supervisor:
     def _parse_router_output(raw: str, query: str) -> tuple[Intent, str]:
         """
         解析 LLM 输出，支持：
-            "job_search|high"
-            "job_search"         (无置信度时默认 medium)
-            "job_search high"    (空格分隔兼容)
+            "job_query|high"
+            "job_query"         (无置信度时默认 medium)
+            "job_query high"    (空格分隔兼容)
         """
         # 兼容管道符和空格两种分隔
         for sep in ("|", " "):
