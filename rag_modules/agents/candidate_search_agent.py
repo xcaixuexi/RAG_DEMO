@@ -9,9 +9,17 @@ API 响应格式：
     {
         "intent": "candidate_query",
         "data": {
+            "message": "产品经理职位共50条候选人记录",
             "total": 50,
-            "candidates": [...],
-            "message": "产品经理职位共50条候选人记录"
+            "list_type": "candidates",
+            "items": [...],
+            "pagination": {
+                "page": 1,
+                "page_size": 20,
+                "total_pages": 3,
+                "fetched": 50,
+                "total_db": 50
+            }
         },
         "status": "success"
     }
@@ -33,6 +41,11 @@ v3 变更（方案一）：
         · 查询在职员工数（status=3）
       对应从 platform_stats_agent 迁出的 apply_count 场景
     - recruiter Prompt 不变
+
+v4 变更（统一响应规范）：
+    - _build_response() 响应结构统一：candidates → items，新增 total / list_type 字段
+    - count-only 响应补充 total / list_type / items=[]
+    - 无结果响应补充 total=0 / list_type / items=[]
 """
 
 import json
@@ -57,9 +70,6 @@ RESULT_TYPE = "candidates"
 
 # ─────────────────────────────────────────────
 # Prompt — recruiter 版（注入 company_id）
-#
-# 使用 string.Template（$company_id）而非 str.format()，
-# 避免 prompt 中 JSON 示例的花括号 {} 与 .format() 占位符冲突。
 # ─────────────────────────────────────────────
 
 _SQL_SYSTEM_RECRUITER_TEMPLATE = Template("""你是一个招聘数据库查询助手，正在帮助招聘者查询自己公司的候选人和报名情况。
@@ -137,7 +147,6 @@ Few-Shot 示例（company_id 均用 $company_id）
 # ─────────────────────────────────────────────
 # Prompt — admin 版（注入 tenant_id）
 # v3 扩展：补充报名统计 Few-Shot（总报名数、某职位报名总数、在职员工数）
-# 对应从 platform_stats_agent 迁出的 apply_count 场景
 # ─────────────────────────────────────────────
 
 _SQL_SYSTEM_ADMIN_TEMPLATE = Template("""你是一个招聘数据库查询助手，正在帮助平台管理员查询该租户下所有公司的候选人和报名情况。
@@ -293,7 +302,6 @@ def _validate_scope_filter(sql: str, company_id: Optional[int], tenant_id: Optio
     """
     第三道防线：校验 SQL 包含对应的范围过滤条件。
     recruiter 模式校验 company_id，admin 模式校验 tenant_id。
-    扩展自原 _validate_company_id()，同时支持两种过滤方式。
     """
     if company_id is not None:
         return bool(
@@ -306,18 +314,28 @@ def _validate_scope_filter(sql: str, company_id: Optional[int], tenant_id: Optio
     return False
 
 
-def _error_response(message):
-    # v3：intent 字段改为 candidate_query
-    return {"intent": "candidate_query", "data": {"message": message}, "status": "error"}
-
-
-def _build_response(page_data, total_db, message):
-    # v3：intent 字段改为 candidate_query
+def _error_response(message: str) -> dict:
     return {
         "intent": "candidate_query",
         "data": {
-            "message":     message,
-            "candidates":  page_data["items"],
+            "message":    message,
+            "total":      None,
+            "list_type":  None,
+            "items":      None,
+            "pagination": None,
+        },
+        "status": "error",
+    }
+
+
+def _build_response(page_data: dict, total_db: int, message: str) -> dict:
+    return {
+        "intent": "candidate_query",
+        "data": {
+            "message":    message,
+            "total":      total_db,
+            "list_type":  "candidates",
+            "items":      page_data["items"],
             "pagination": {
                 "page":        page_data["page"],
                 "page_size":   page_data["page_size"],
@@ -403,13 +421,14 @@ def handle(
     if count_only:
         if total_db < 0:
             total_db = 0
-        # v3：intent 字段改为 candidate_query
         return {
             "intent": "candidate_query",
             "data": {
                 "message":    f"{llm_msg}，共 {total_db} 条记录",
-                "candidates": [],
-                "pagination": None,   # 无分页数据，前端不渲染翻页组件
+                "total":      total_db,
+                "list_type":  "candidates",
+                "items":      [],
+                "pagination": None,
             },
             "status": "success",
         }
@@ -420,12 +439,13 @@ def handle(
         total_db = len(candidates)
 
     if not candidates:
-        # v3：intent 字段改为 candidate_query
         return {
             "intent": "candidate_query",
             "data": {
-                "message": f"{llm_msg}，暂无符合条件的候选人",
-                "candidates": [],
+                "message":    f"{llm_msg}，暂无符合条件的候选人",
+                "total":      0,
+                "list_type":  "candidates",
+                "items":      [],
                 "pagination": {
                     "page": 1, "page_size": page_size,
                     "total_pages": 0, "fetched": 0, "total_db": 0,

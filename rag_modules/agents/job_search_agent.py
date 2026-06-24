@@ -8,9 +8,17 @@ API 响应格式：
     {
         "intent": "job_search",
         "data": {
+            "message": "深圳Python开发职位，共找到1523个职位",
             "total": 1523,
-            "jobs": [...],
-            "message": "深圳Python开发职位，共找到1523个职位"
+            "list_type": "jobs",
+            "items": [...],
+            "pagination": {
+                "page": 1,
+                "page_size": 20,
+                "total_pages": 5,
+                "fetched": 87,
+                "total_db": 1523
+            }
         },
         "status": "success"
     }
@@ -31,6 +39,11 @@ v3 变更：
     - 新增 _SQL_SYSTEM_ADMIN_TEMPLATE（string.Template，注入 tenant_id）
     - _validate_tenant_id()：admin 路径下校验 SQL 是否包含 tenant_id 过滤（第三道防线）
     - jobseeker 路径使用原 _SQL_SYSTEM，不受影响
+
+v4 变更（统一响应规范）：
+    - _build_response() 响应结构统一：jobs → items，新增 total / list_type 字段
+    - count-only 响应补充 total / list_type / items=[]
+    - 无结果响应补充 total=0 / list_type / items=[]
 """
 
 import json
@@ -264,7 +277,17 @@ def _validate_tenant_id(sql: str, tenant_id: int) -> bool:
 
 
 def _error_response(message: str) -> dict:
-    return {"intent": "job_search", "data": {"message": message}, "status": "error"}
+    return {
+        "intent": "job_search",
+        "data": {
+            "message":    message,
+            "total":      None,
+            "list_type":  None,
+            "items":      None,
+            "pagination": None,
+        },
+        "status": "error",
+    }
 
 
 def _build_response(page_data: dict, total_db: int, message: str) -> dict:
@@ -272,8 +295,10 @@ def _build_response(page_data: dict, total_db: int, message: str) -> dict:
     return {
         "intent": "job_search",
         "data": {
-            "message":     message,
-            "jobs":        page_data["items"],
+            "message":    message,
+            "total":      total_db,
+            "list_type":  "jobs",
+            "items":      page_data["items"],
             "pagination": {
                 "page":        page_data["page"],
                 "page_size":   page_data["page_size"],
@@ -359,13 +384,15 @@ def handle(
             "intent": "job_search",
             "data": {
                 "message":    f"{llm_msg}，共找到 {total_db} 个职位",
-                "jobs":       [],
-                "pagination": None,   # 无分页数据，前端不渲染翻页组件
+                "total":      total_db,
+                "list_type":  "jobs",
+                "items":      [],
+                "pagination": None,
             },
             "status": "success",
         }
 
-    jobs = repo.execute_job_query(list_sql)     # SQL 已含 LIMIT 100
+    jobs = repo.execute_job_query(list_sql)
 
     if total_db < 0:
         total_db = len(jobs)
@@ -375,8 +402,10 @@ def handle(
         return {
             "intent": "job_search",
             "data": {
-                "message": guide,
-                "jobs":    [],
+                "message":    guide,
+                "total":      0,
+                "list_type":  "jobs",
+                "items":      [],
                 "pagination": {
                     "page": 1, "page_size": page_size,
                     "total_pages": 0, "fetched": 0, "total_db": 0,

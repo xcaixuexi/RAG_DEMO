@@ -9,9 +9,17 @@ API 响应格式：
     {
         "intent": "job_manage",
         "data": {
+            "message": "您公司当前有5个在招职位",
             "total": 5,
-            "jobs": [...],
-            "message": "您公司当前有5个在招职位"
+            "list_type": "jobs",
+            "items": [...],
+            "pagination": {
+                "page": 1,
+                "page_size": 20,
+                "total_pages": 1,
+                "fetched": 5,
+                "total_db": 5
+            }
         },
         "status": "success"
     }
@@ -32,6 +40,11 @@ v3 变更（方案一）：
         · 查询某城市在招职位数（带城市过滤）
       对应 platform_stats_agent 迁出的 job_active/job_pending/job_by_city/job_count 场景
     - recruiter Prompt 不变（recruiter 不接收跨城市统计需求）
+
+v4 变更（统一响应规范）：
+    - _build_response() 响应结构统一：jobs → items，新增 total / list_type 字段
+    - count-only 响应补充 total / list_type / items=[]
+    - 无结果响应补充 total=0 / list_type / items=[]
 """
 
 import json
@@ -134,7 +147,6 @@ Few-Shot 示例（company_id 均用 $company_id）
 # ─────────────────────────────────────────────
 # Prompt — admin 版（注入 tenant_id）
 # v3 扩展：补充统计场景 Few-Shot（各城市分布、待审核职位、在招总数、按状态分组统计）
-# 对应从 platform_stats_agent 迁出的 job_active/job_pending/job_by_city/job_count 场景
 # ─────────────────────────────────────────────
 
 _SQL_SYSTEM_ADMIN_TEMPLATE = Template("""你是一个招聘数据库查询助手，正在帮助平台管理员查看该租户下所有公司发布的职位。
@@ -300,7 +312,6 @@ def _validate_scope_filter(sql: str, company_id: Optional[int], tenant_id: Optio
     """
     第三道防线：校验 SQL 包含对应的范围过滤条件。
     recruiter 模式校验 company_id，admin 模式校验 tenant_id。
-    扩展自原 _validate_company_id()，同时支持两种过滤方式。
     """
     if company_id is not None:
         return bool(
@@ -314,15 +325,27 @@ def _validate_scope_filter(sql: str, company_id: Optional[int], tenant_id: Optio
 
 
 def _error_response(message: str) -> dict:
-    return {"intent": "job_manage", "data": {"message": message}, "status": "error"}
-
-
-def _build_response(page_data, total_db, message):
     return {
         "intent": "job_manage",
         "data": {
-            "message": message,
-            "jobs":    page_data["items"],
+            "message":    message,
+            "total":      None,
+            "list_type":  None,
+            "items":      None,
+            "pagination": None,
+        },
+        "status": "error",
+    }
+
+
+def _build_response(page_data: dict, total_db: int, message: str) -> dict:
+    return {
+        "intent": "job_manage",
+        "data": {
+            "message":    message,
+            "total":      total_db,
+            "list_type":  "jobs",
+            "items":      page_data["items"],
             "pagination": {
                 "page":        page_data["page"],
                 "page_size":   page_data["page_size"],
@@ -333,6 +356,7 @@ def _build_response(page_data, total_db, message):
         },
         "status": "success",
     }
+
 
 # ─────────────────────────────────────────────
 # 对外接口
@@ -386,11 +410,10 @@ def handle(
 
     count_sql = parsed["count_sql"]
     list_sql  = parsed["list_sql"]
+    llm_msg   = parsed.get("message", "查询公司职位")
 
     logger.info(f"[job_manage_agent]  count_sql: {count_sql}")
     logger.info(f"[job_manage_agent]  list_sql:  {list_sql}")
-
-    llm_msg   = parsed.get("message", "查询公司职位")
 
     # 第三道防线：SQL 安全校验
     for sql_name, sql in [("count_sql", count_sql), ("list_sql", list_sql)]:
@@ -401,11 +424,11 @@ def handle(
             )
             return _error_response("查询生成异常，请重试或联系管理员")
 
-    repo     = JobRepo()
+    repo = JobRepo()
 
     # count-only 模式：只查总数，跳过 list_sql
     count_only = _is_count_only(query)
-    total_db = repo.execute_count_query(count_sql)
+    total_db   = repo.execute_count_query(count_sql)
 
     if count_only:
         if total_db < 0:
@@ -414,8 +437,10 @@ def handle(
             "intent": "job_manage",
             "data": {
                 "message":    f"{llm_msg}，共 {total_db} 个职位",
-                "jobs":       [],
-                "pagination": None,   # 无分页数据，前端不渲染翻页组件
+                "total":      total_db,
+                "list_type":  "jobs",
+                "items":      [],
+                "pagination": None,
             },
             "status": "success",
         }
@@ -429,8 +454,10 @@ def handle(
         return {
             "intent": "job_manage",
             "data": {
-                "message": f"{llm_msg}，暂无符合条件的职位",
-                "jobs":    [],
+                "message":    f"{llm_msg}，暂无符合条件的职位",
+                "total":      0,
+                "list_type":  "jobs",
+                "items":      [],
                 "pagination": {
                     "page": 1, "page_size": page_size,
                     "total_pages": 0, "fetched": 0, "total_db": 0,

@@ -12,53 +12,16 @@ platform_stats_agent.py — 平台管理员数据统计 Agent
     分析词检测        — 命中固定模板但含"对比/趋势/分析/分布"等分析词时走 LLM
     LLM 兜底          — 未命中固定模板时一律走 LLM，不返回引导语
 
-v1（初始版本）：
-    - 8 个固定模板，支持参数提取（城市/行业/时间动态注入）
-    - _detect_complex_query()：时间词 + 分析词均触发 LLM
-    - 未命中时返回引导语
-
-v2 变更：
-    - 固定模板扩充关键词，新增追问场景词
-    - _match_fixed_template() → _match_fixed_templates()，返回所有命中 key 列表
-    - 新增 _dedup_keys()：job_count + job_active 同时命中时保留 job_count
-    - _extract_params() 提取城市/行业/时间，_build_fixed_sql() 支持参数动态注入
-    - _format_fixed_result() 感知城市/行业/时间上下文
-    - _execute_multi_templates() 并行执行多条预设 SQL
-    - _detect_complex_query() 移除时间类词，只保留分析对比类词
-    - _LLM_SQL_SYSTEM 末尾追加多需求 → JSON 数组格式说明
-    - _handle_llm() 支持 LLM 返回单对象或数组
-
-v3 重构：
-    - 固定模板精简为 5 个完全无参数的模板，移除 job_active / job_by_city / company_by_industry
-    - 删除 _extract_params()、_COMPLEX_SIGNALS、_GUIDE_MESSAGE、_guide_response()
-    - 删除所有函数签名中的 params 参数
-    - _detect_complex_query() 改名为 _has_analysis_signals()，职责收窄为"检测分析对比词"
-    - 新增 _TIME_SIGNALS 和时间词前置检测（放在模板匹配之前，逻辑独立）
-    - handle() 主流程简化：时间词 → LLM；固定模板+分析词 → LLM；固定模板 → 预设SQL；其余 → LLM
-    - _build_fixed_sql() 移除所有参数注入，每个模板只有一条固定 SQL
-    - _format_fixed_result() 移除 params 参数
-    - _execute_multi_templates() 移除 params 参数
-
-v4 修复（_LLM_SQL_SYSTEM Prompt 问题修复）：
-    - 修复字段说明缺失：原 Prompt 只罗列了三张表名，job 表字段说明被错误地插入在
-      "可查询的表"和"数据隔离规则"中间，且完全没有 company 表和 employees_apply 表的
-      字段说明，导致 LLM 在涉及这两张表的查询时容易编造字段名或查询失败。
-      现已补全三张表的完整字段清单（字段名、类型、含义、可选值域），并说明三表关联关系
-      及 employees_apply 表本身无 tenant_id、必须 JOIN company/job 获取 tenant_id 的隔离规则。
-    - 修复缺少 Few-Shot 示例：原 Prompt 只给了"多需求 JSON 数组"的格式说明，没有任何
-      具体查询示例。现新增 7 个 Few-Shot 示例，覆盖单表统计、GROUP BY 分组、时间范围过滤、
-      跨表 JOIN（employees_apply 关联 company/job）、多需求数组、单需求单对象等典型场景。
-
-API 响应统一格式：
-    {
-        "intent": "platform_stats",
-        "data": {
-            "message": "...",
-            "stats": {...}   # 固定模板时的结构化数据（可选）
-            "rows":  [...]   # LLM 生成 SQL 的原始查询结果（可选）
-        },
-        "status": "success"
-    }
+v4 变更（统一响应规范 + 列表分页支持）：
+    - handle() 新增 session_id / page_size 参数
+    - _handle_llm() 新增列表判断逻辑：
+        · SQL 结果为聚合统计（列数 ≤ 2 或含 GROUP BY）→ 走 stats_rows 路径
+        · SQL 结果为列表（列数 ≥ 3 且行数 > page_size）→ 写分页缓存，返回第 1 页
+        · SQL 结果为列表（列数 ≥ 3 且行数 ≤ page_size）→ 直接返回，单页
+    - 统一响应结构：所有响应均包含 message / total / list_type / items / pagination
+    - 固定模板纯数字统计响应补充 total 字段
+    - stats_rows（GROUP BY 聚合结果）作为专属字段保留，total/items/pagination 均为 null
+    - ChatController._call_platform_stats() 同步透传 session_id 和 page_size
 """
 
 import json
@@ -70,21 +33,18 @@ from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_openai import ChatOpenAI
 from langchain_core.output_parsers import StrOutputParser
 
+from controller.session_manager import (
+    save_page_cache, get_page, DEFAULT_PAGE_SIZE,
+)
+
 logger = logging.getLogger(__name__)
 
+RESULT_TYPE = "stats_rows"
 
 # ─────────────────────────────────────────────
 # 固定模板配置（v3：精简为 5 个完全无参数的模板）
-#
-# 移除的模板（v3）：
-#   job_active       — 需要城市参数，交给 LLM 处理更准确
-#   job_by_city      — 需要城市参数，交给 LLM 处理更准确
-#   company_by_industry — 需要行业参数，交给 LLM 处理更准确
 # ─────────────────────────────────────────────
 
-# 每个模板结构：
-#   keywords — 触发词列表
-#   params   — 该模板支持动态注入的参数名列表（空表示无动态参数）
 _FIXED_TEMPLATES: dict[str, dict] = {
     "company_count": {
         "keywords": ["企业总数", "公司总数", "多少家企业", "多少家公司"],
@@ -114,9 +74,6 @@ _FIXED_TEMPLATES: dict[str, dict] = {
 
 # ─────────────────────────────────────────────
 # 时间词前置检测（v3 新增）
-#
-# 含时间词时直接走 LLM，不进入固定模板匹配。
-# 原因："上个月报名总数"会命中 apply_count，但固定 SQL 无时间条件，结果不正确。
 # ─────────────────────────────────────────────
 
 _TIME_SIGNALS: list[str] = [
@@ -127,9 +84,6 @@ _TIME_SIGNALS: list[str] = [
 
 # ─────────────────────────────────────────────
 # 分析信号词（v3：原 _COMPLEX_SIGNALS 改名并精简）
-#
-# 只保留"对比/趋势/分析"等真正需要 LLM 复杂 SQL 的场景。
-# 时间词已移出，由 _TIME_SIGNALS 前置处理。
 # ─────────────────────────────────────────────
 
 _ANALYSIS_SIGNALS: list[str] = [
@@ -139,10 +93,7 @@ _ANALYSIS_SIGNALS: list[str] = [
 
 
 def _has_analysis_signals(query: str) -> bool:
-    """
-    检测是否含分析对比类词（原 _detect_complex_query，v3 改名）。
-    职责收窄为"检测分析对比词"，时间词检测已移到 handle() 前置。
-    """
+    """检测是否含分析对比类词（原 _detect_complex_query，v3 改名）"""
     return any(sig in query for sig in _ANALYSIS_SIGNALS)
 
 
@@ -270,9 +221,7 @@ Few-Shot 示例
 # ─────────────────────────────────────────────
 
 def _match_fixed_templates(query: str) -> list[str]:
-    """
-    返回所有命中的模板 key 列表（按 _FIXED_TEMPLATES 定义顺序），未命中返回空列表。
-    """
+    """返回所有命中的模板 key 列表，未命中返回空列表。"""
     text    = query.strip()
     matched = []
     for key, conf in _FIXED_TEMPLATES.items():
@@ -295,69 +244,61 @@ def _dedup_keys(keys: list[str]) -> list[str]:
 
 
 # ─────────────────────────────────────────────
-# 固定 SQL 构建（v3：移除所有参数注入，每个模板只有一条固定 SQL）
+# 固定 SQL 构建（v3：移除所有参数注入）
 # ─────────────────────────────────────────────
 
 def _build_fixed_sql(key: str, tenant_id: int) -> Optional[str]:
-    """
-    根据模板 key 和 tenant_id 构建固定预设 SQL。
-    v3 变更：移除 params 参数，不再做城市/行业/时间动态注入。
-    含动态条件的查询（城市、行业、时间过滤）一律由 LLM 处理。
-    """
+    """根据模板 key 和 tenant_id 构建固定预设 SQL。"""
     if key == "company_count":
         return (
             f"SELECT COUNT(*) AS total FROM company "
             f"WHERE tenant_id={tenant_id} AND is_delete=0"
         )
-
     elif key == "company_pending":
         return (
             f"SELECT COUNT(*) AS total FROM company "
             f"WHERE tenant_id={tenant_id} AND is_delete=0 AND apply_status=0"
         )
-
     elif key == "job_count":
         return (
             f"SELECT status, COUNT(*) AS cnt FROM job "
             f"WHERE tenant_id={tenant_id} AND is_delete=0 "
             f"GROUP BY status"
         )
-
     elif key == "job_pending":
         return (
             f"SELECT COUNT(*) AS total FROM job "
             f"WHERE tenant_id={tenant_id} AND is_delete=0 AND audit_status=0"
         )
-
     elif key == "apply_count":
         return (
             f"SELECT COUNT(*) AS total FROM employees_apply ea "
             f"LEFT JOIN job j ON ea.job_id = j.id "
             f"WHERE j.tenant_id={tenant_id}"
         )
-
     return None
 
 
 # ─────────────────────────────────────────────
-# 结果格式化（v3：移除 params 参数，不再感知城市/行业/时间上下文）
+# 结果格式化（固定模板路径）
 # ─────────────────────────────────────────────
 
-def _format_fixed_result(template_key: str, rows: list[dict]) -> tuple[str, dict]:
+def _format_fixed_result(template_key: str, rows: list[dict]) -> tuple[str, Optional[int], Optional[list]]:
     """
-    将固定模板查询结果格式化为 (message, stats_dict)。
-    v3 变更：移除 params 参数，格式化逻辑不再感知城市/行业/时间上下文。
+    将固定模板查询结果格式化为 (message, total, stats_rows)。
+    纯数字统计：返回 (message, total_int, None)
+    GROUP BY 统计：返回 (message, None, rows_list)
     """
     if not rows:
-        return "暂无数据", {}
+        return "暂无数据", None, None
 
     if template_key == "company_count":
         total = rows[0].get("total", 0)
-        return f"平台共有 {total} 家企业", {"total": total}
+        return f"平台共有 {total} 家企业", total, None
 
     if template_key == "company_pending":
-        pending = rows[0].get("total", 0)
-        return f"待审核企业共 {pending} 家", {"pending": pending}
+        total = rows[0].get("total", 0)
+        return f"待审核企业共 {total} 家", total, None
 
     if template_key == "job_count":
         _status_label = {0: "未审核", 1: "已发布", 2: "不通过", 3: "停止发布"}
@@ -365,37 +306,31 @@ def _format_fixed_result(template_key: str, rows: list[dict]) -> tuple[str, dict
             f"{_status_label.get(r.get('status'), '未知')}（{r.get('cnt', 0)} 个）"
             for r in rows
         ]
-        return "职位状态分布：" + "、".join(parts), {"rows": rows}
+        return "职位状态分布：" + "、".join(parts), None, rows
 
     if template_key == "job_pending":
         total = rows[0].get("total", 0)
-        return f"待审核职位共 {total} 个", {"total": total}
+        return f"待审核职位共 {total} 个", total, None
 
     if template_key == "apply_count":
         total = rows[0].get("total", 0)
-        return f"平台总报名记录共 {total} 条", {"total": total}
+        return f"平台总报名记录共 {total} 条", total, None
 
-    return "查询完成", {"rows": rows}
+    return "查询完成", None, rows
 
 
 # ─────────────────────────────────────────────
-# 多模板并行执行与结果合并（v3：移除 params 参数）
+# 多模板并行执行与结果合并
 # ─────────────────────────────────────────────
 
 def _execute_multi_templates(keys: list[str], tenant_id: int) -> dict:
     """
     并行执行多个固定模板 SQL，合并结果。
-    单条执行失败时跳过（不终止整体），仍返回其余成功结果。
-    v3 变更：移除 params 参数，_build_fixed_sql 和 _format_fixed_result 签名同步简化。
-
-    返回：
-        {
-            "message": "结果1；结果2",
-            "stats":   {合并的结构化数据}
-        }
+    返回：{"message": "...", "total": int_or_None, "stats_rows": list_or_None}
     """
-    messages: list[str] = []
-    stats:    dict      = {}
+    messages:   list[str]        = []
+    totals:     list[int]        = []
+    stats_rows: list[dict]       = []
 
     for key in keys:
         sql = _build_fixed_sql(key, tenant_id)
@@ -408,17 +343,20 @@ def _execute_multi_templates(keys: list[str], tenant_id: int) -> dict:
             logger.error(f"[platform_stats] 模板 {key} 执行失败: {err}")
             continue
 
-        msg, stat = _format_fixed_result(key, rows)
+        msg, total, group_rows = _format_fixed_result(key, rows)
         messages.append(msg)
+        if total is not None:
+            totals.append(total)
+        if group_rows:
+            stats_rows.extend(group_rows)
 
-        # 合并 stats，分组类数据用带前缀的 key 区分，避免多模板结果互相覆盖
-        for k, v in stat.items():
-            stats_key = f"{key}_{k}" if k in stats else k
-            stats[stats_key] = v
+    # 多模板时 total 取各纯数字统计之和（仅当所有命中模板均为纯数字统计时有意义）
+    merged_total = sum(totals) if totals and not stats_rows else None
 
     return {
-        "message": "；".join(messages) if messages else "暂无数据",
-        "stats":   stats,
+        "message":    "；".join(messages) if messages else "暂无数据",
+        "total":      merged_total,
+        "stats_rows": stats_rows if stats_rows else None,
     }
 
 
@@ -427,10 +365,7 @@ def _execute_multi_templates(keys: list[str], tenant_id: int) -> dict:
 # ─────────────────────────────────────────────
 
 def _execute_sql(sql: str) -> tuple[list[dict], Optional[str]]:
-    """
-    执行 SQL，返回 (rows, error_message)。
-    rows 为 list[dict]，error_message 不为 None 表示出错。
-    """
+    """执行 SQL，返回 (rows, error_message)。"""
     from sqlalchemy import text
     from db.mysql_client import MySQLClient
 
@@ -453,12 +388,34 @@ def _validate_tenant_id(sql: str, tenant_id: int) -> bool:
     )
 
 
-def _build_response(message: str, stats: Optional[dict] = None, rows: Optional[list] = None) -> dict:
-    data: dict = {"message": message}
-    if stats:
-        data["stats"] = stats
-    if rows is not None:
-        data["rows"] = rows
+def _is_aggregate_result(rows: list[dict]) -> bool:
+    """
+    判断查询结果是否为聚合统计（而非列表数据）。
+    列数 ≤ 2，或字段名含 total/cnt/count 时视为聚合统计。
+    """
+    if not rows:
+        return True
+    keys = list(rows[0].keys())
+    if len(keys) <= 2:
+        return True
+    agg_names = {"total", "cnt", "count"}
+    if any(k.lower() in agg_names for k in keys):
+        return True
+    return False
+
+
+def _build_text_response(message: str, total: Optional[int] = None,
+                         stats_rows: Optional[list] = None) -> dict:
+    """构造固定模板 / 纯统计数字的统一响应"""
+    data: dict = {
+        "message":    message,
+        "total":      total,
+        "list_type":  None,
+        "items":      None,
+        "pagination": None,
+    }
+    if stats_rows is not None:
+        data["stats_rows"] = stats_rows
     return {
         "intent": "platform_stats",
         "data":   data,
@@ -466,16 +423,45 @@ def _build_response(message: str, stats: Optional[dict] = None, rows: Optional[l
     }
 
 
+def _build_list_response(items: list[dict], total_db: int, message: str,
+                         page_data: dict) -> dict:
+    """构造列表分页响应"""
+    return {
+        "intent": "platform_stats",
+        "data": {
+            "message":    message,
+            "total":      total_db,
+            "list_type":  "stats_rows",
+            "items":      page_data["items"],
+            "pagination": {
+                "page":        page_data["page"],
+                "page_size":   page_data["page_size"],
+                "total_pages": page_data["total_pages"],
+                "fetched":     page_data["fetched"],
+                "total_db":    total_db,
+            },
+        },
+        "status": "success",
+    }
+
+
 def _error_response(message: str) -> dict:
     return {
         "intent": "platform_stats",
-        "data":   {"message": message},
+        "data": {
+            "message":    message,
+            "total":      None,
+            "list_type":  None,
+            "items":      None,
+            "pagination": None,
+        },
         "status": "error",
     }
 
 
 # ─────────────────────────────────────────────
 # LLM 路径（支持单对象 / 数组两种返回格式）
+# v4 新增：列表判断逻辑 + 分页缓存支持
 # ─────────────────────────────────────────────
 
 def _call_llm_raw(query: str, tenant_id: int, llm: ChatOpenAI) -> str:
@@ -486,7 +472,6 @@ def _call_llm_raw(query: str, tenant_id: int, llm: ChatOpenAI) -> str:
         HumanMessage(content=query),
     ]
     raw = (llm | StrOutputParser()).invoke(messages).strip()
-    # 兼容 ```json 围栏
     if raw.startswith("```"):
         lines = raw.splitlines()
         inner = lines[1:-1] if lines[-1].strip() == "```" else lines[1:]
@@ -494,11 +479,19 @@ def _call_llm_raw(query: str, tenant_id: int, llm: ChatOpenAI) -> str:
     return raw
 
 
-def _handle_llm(query: str, tenant_id: int, llm: ChatOpenAI) -> dict:
+def _handle_llm(
+    query:      str,
+    tenant_id:  int,
+    llm:        ChatOpenAI,
+    session_id: str,
+    page_size:  int,
+) -> dict:
     """
-    LLM 路径：调用 LLM 生成 SQL → 执行 → 合并结果。
-    支持 LLM 返回单个对象（一个需求）或数组（多个独立需求）。
-    每条 SQL 独立做 tenant_id 安全校验，校验失败时整体拒绝。
+    LLM 路径：调用 LLM 生成 SQL → 执行 → 判断结果类型 → 返回。
+
+    v4 新增：执行完 SQL 后根据结果结构判断：
+        - 聚合统计（列数 ≤ 2 或含 total/cnt）→ stats_rows 路径，直接返回
+        - 列表数据（列数 ≥ 3）→ 写分页缓存，返回第 1 页（行数 ≤ page_size 时单页直返）
     """
     logger.info(f"[platform_stats] 走 LLM 路径: '{query}'")
 
@@ -513,8 +506,10 @@ def _handle_llm(query: str, tenant_id: int, llm: ChatOpenAI) -> dict:
     # 统一为列表处理（单对象包装为单元素列表）
     items: list[dict] = parsed if isinstance(parsed, list) else [parsed]
 
-    messages:  list[str]  = []
-    rows_all:  list[dict] = []
+    agg_messages:  list[str]  = []
+    agg_stats_rows: list[dict] = []
+    list_rows_all:  list[dict] = []
+    list_messages:  list[str]  = []
 
     for item in items:
         sql = item.get("sql", "").strip()
@@ -531,13 +526,72 @@ def _handle_llm(query: str, tenant_id: int, llm: ChatOpenAI) -> dict:
             logger.error(f"[platform_stats] LLM SQL 执行失败: {err}")
             continue
 
-        messages.append(item.get("message", "查询完成"))
-        rows_all.extend(rows)
+        msg = item.get("message", "查询完成")
 
-    if not messages:
+        if _is_aggregate_result(rows):
+            # 聚合统计：走 stats_rows 路径
+            agg_messages.append(msg)
+            agg_stats_rows.extend(rows)
+        else:
+            # 列表数据：走分页路径
+            list_messages.append(msg)
+            list_rows_all.extend(rows)
+
+    # 存在列表数据时走分页逻辑
+    if list_rows_all:
+        total_db  = len(list_rows_all)
+        message   = "；".join(list_messages) if list_messages else "查询完成"
+
+        if total_db <= page_size:
+            # 行数 ≤ 每页大小，直接单页返回
+            page_data = {
+                "items":       list_rows_all,
+                "page":        1,
+                "page_size":   page_size,
+                "total_pages": 1,
+                "fetched":     total_db,
+                "total_db":    total_db,
+            }
+        else:
+            # 写入分页缓存
+            save_page_cache(
+                session_id  = session_id,
+                result_type = RESULT_TYPE,
+                items       = list_rows_all,
+                total_db    = total_db,
+                query       = query,
+            )
+            page_data = get_page(session_id, RESULT_TYPE, page=1, page_size=page_size)
+
+        # 若同时存在聚合结果，拼入 message
+        if agg_messages:
+            message = "；".join(agg_messages) + "；" + message
+
+        return _build_list_response(list_rows_all, total_db, message, page_data)
+
+    # 纯聚合统计路径
+    if not agg_messages:
         return _error_response("查询执行失败，请稍后重试")
 
-    return _build_response("；".join(messages), rows=rows_all)
+    # 判断 total：仅单行单列 total/cnt 字段时提取数值
+    total: Optional[int] = None
+    if len(agg_stats_rows) == 1:
+        row = agg_stats_rows[0]
+        for field in ("total", "cnt", "count"):
+            if field in row:
+                try:
+                    total = int(row[field])
+                except (TypeError, ValueError):
+                    pass
+                break
+
+    stats_rows_out = agg_stats_rows if len(agg_stats_rows) > 1 or total is None else None
+
+    return _build_text_response(
+        message    = "；".join(agg_messages),
+        total      = total,
+        stats_rows = stats_rows_out,
+    )
 
 
 # ─────────────────────────────────────────────
@@ -545,28 +599,27 @@ def _handle_llm(query: str, tenant_id: int, llm: ChatOpenAI) -> dict:
 # ─────────────────────────────────────────────
 
 def handle(
-    query:     str,
-    tenant_id: int,
-    llm:       Optional[ChatOpenAI] = None,
+    query:      str,
+    tenant_id:  int,
+    session_id: str = "",
+    llm:        Optional[ChatOpenAI] = None,
+    page_size:  int = DEFAULT_PAGE_SIZE,
 ) -> dict:
     """
-    平台统计 Agent 主入口（v3 重构）。
+    平台统计 Agent 主入口（v4 重构）。
 
     路由流程（优先级从高到低）：
-        1. 含时间词（今天/本月/上个月等）
-               → 直接走 LLM（固定 SQL 无时间条件，结果会不正确）
-        2. 命中固定模板 + 含分析词（对比/趋势/分析/分布等）
-               → 整句走 LLM（保留完整语义，LLM 处理分析需求）
-        3. 命中固定模板，无分析词
-               → 单模板：执行对应预设 SQL，返回结构化结果
-               → 多模板：并行执行，合并结果
-        4. 未命中任何固定模板
-               → 直接走 LLM，不返回引导语（v3 移除引导语）
+        1. 含时间词（今天/本月/上个月等）→ 直接走 LLM
+        2. 命中固定模板 + 含分析词 → 走 LLM
+        3. 命中固定模板，无分析词 → 执行预设 SQL
+        4. 未命中 → 直接走 LLM
 
     Args:
-        query:     用户输入
-        tenant_id: 当前 admin 关联的租户 ID（由 ChatController 强制注入）
-        llm:       ChatOpenAI 实例，由 ChatController 从 Supervisor 传入
+        query:      用户输入
+        tenant_id:  当前 admin 关联的租户 ID（由 ChatController 强制注入）
+        session_id: 会话 ID，用于写入列表查询的分页缓存（v4 新增）
+        llm:        ChatOpenAI 实例，由 ChatController 从 Supervisor 传入
+        page_size:  每页条数（v4 新增）
 
     Returns:
         统一响应字典
@@ -575,44 +628,41 @@ def handle(
         logger.error("[platform_stats] llm 未传入")
         return _error_response("系统配置错误，请联系管理员")
 
-    # ── 时间词前置检测（v3 新增）─────────────────────────────────
-    # 含时间词时直接走 LLM，不进入固定模板匹配，避免固定 SQL 丢失时间条件。
-    # 例："上个月报名总数"会命中 apply_count，但固定 SQL 查全量，结果不正确。
+    # ── 时间词前置检测 ─────────────────────────────────────────────
     if any(sig in query for sig in _TIME_SIGNALS):
         logger.info(f"[platform_stats] 含时间词，直接走 LLM: '{query}'")
-        return _handle_llm(query, tenant_id, llm)
+        return _handle_llm(query, tenant_id, llm, session_id, page_size)
 
     matched_keys = _dedup_keys(_match_fixed_templates(query))
 
     # ── 命中固定模板，但含分析对比词 → 整句走 LLM ────────────────
     if matched_keys and _has_analysis_signals(query):
         logger.info(f"[platform_stats] 命中模板 {matched_keys} 但含分析词，走 LLM: '{query}'")
-        return _handle_llm(query, tenant_id, llm)
+        return _handle_llm(query, tenant_id, llm, session_id, page_size)
 
     # ── 命中固定模板，无分析词 → 预设 SQL 路径 ────────────────────
     if matched_keys:
         if len(matched_keys) == 1:
-            # 单模板命中
             key  = matched_keys[0]
             sql  = _build_fixed_sql(key, tenant_id)
             if sql is None:
-                # 理论上不会发生（5 个模板均有固定 SQL），兜底走 LLM
-                return _handle_llm(query, tenant_id, llm)
+                return _handle_llm(query, tenant_id, llm, session_id, page_size)
 
             rows, err = _execute_sql(sql)
             if err:
                 return _error_response("数据查询失败，请稍后重试")
 
-            message, stats = _format_fixed_result(key, rows)
-            if "rows" in stats:
-                return _build_response(message, rows=stats["rows"])
-            return _build_response(message, stats=stats)
+            msg, total, stats_rows = _format_fixed_result(key, rows)
+            return _build_text_response(message=msg, total=total, stats_rows=stats_rows)
 
         else:
-            # 多模板命中：并行执行，合并结果
             logger.info(f"[platform_stats] 多模板并行执行: {matched_keys}")
             result = _execute_multi_templates(matched_keys, tenant_id)
-            return _build_response(result["message"], stats=result["stats"] or None)
+            return _build_text_response(
+                message    = result["message"],
+                total      = result["total"],
+                stats_rows = result["stats_rows"],
+            )
 
-    # ── 未命中任何固定模板 → 直接走 LLM（v3 移除引导语兜底）────────
-    return _handle_llm(query, tenant_id, llm)
+    # ── 未命中任何固定模板 → 直接走 LLM ──────────────────────────
+    return _handle_llm(query, tenant_id, llm, session_id, page_size)

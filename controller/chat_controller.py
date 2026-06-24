@@ -53,6 +53,9 @@ v4 变更（方案一：意图按操作类型重构）：
       三者逻辑完整搬迁进 _call_job_query()，无任何逻辑变更
     - _call_candidate_search() / _call_candidate_search_admin() 方法名保留不变
       （仅 agent_map 中的 key 改名为 candidate_query，避免无意义的大范围改名）
+
+v5 变更（统一响应规范）：
+    - _call_platform_stats() 透传 session_id 和 page_size 给 platform_stats_agent
 """
 
 import logging
@@ -98,12 +101,6 @@ _PERMISSION_DENIED_MESSAGES: dict = {
         "抱歉，候选人查询功能仅限招聘者使用。"
         "如需搜索职位，可以告诉我您的求职需求，例如城市、岗位或薪资要求 😊"
     ),
-    # v4 说明：("jobseeker", "job_manage") 条目已删除。
-    # job_search 和 job_manage 合并为 job_query 后，jobseeker 访问 job_query
-    # 会被 _call_job_query() 分发到 job_search_agent（全平台搜索），不存在越权场景。
-    #
-    # v3 说明：admin 白名单已改为 None（不拦截），("admin", "job_search") 条目已移除。
-    # admin 调用 job_query 时会走 _call_job_query() 的 admin 分支，注入 tenant_id。
     # 通用兜底
     "default": "抱歉，您当前身份无权使用该功能，请确认操作是否正确。",
 }
@@ -122,6 +119,9 @@ class ChatController:
     v4 变更：
         - _agent_map 中 job_search/job_manage 合并为 job_query → _call_job_query()
         - candidate_search 改名为 candidate_query（方法体仍是 _call_candidate_search）
+
+    v5 变更：
+        - _call_platform_stats() 透传 session_id 和 page_size
     """
 
     def __init__(
@@ -143,7 +143,6 @@ class ChatController:
         self._pending_file_path = None
 
         # admin 鉴权：在初始化阶段就检查 tenant_id，失败时标记鉴权失败
-        # 鉴权结果缓存在 _auth_failed 和 _cached_tenant_id 中
         self._auth_failed:       bool          = False
         self._cached_tenant_id:  Optional[int] = None
         if self.user_role == "admin":
@@ -174,11 +173,10 @@ class ChatController:
         校验当前角色是否有权访问指定意图。
         - whitelist 为 None（admin）→ 直接放行，所有意图均可访问
         - whitelist 为 set      → intent 必须在集合内
-        v3 新增，替换原 process_message() 中的内联判断逻辑。
         """
         whitelist = _ROLE_INTENT_WHITELIST.get(self.user_role)
         if whitelist is None:
-            return True     # admin：不做意图拦截
+            return True
         return intent in whitelist
 
     # ==================== admin 鉴权 ====================
@@ -216,10 +214,7 @@ class ChatController:
             logger.error(f"[admin鉴权] 数据库查询异常: {e}")
 
     def _get_tenant_id(self) -> Optional[int]:
-        """
-        返回 admin 的 tenant_id（已在 __init__ 阶段缓存）。
-        非 admin 角色返回 None。
-        """
+        """返回 admin 的 tenant_id（已在 __init__ 阶段缓存）。非 admin 角色返回 None。"""
         return self._cached_tenant_id
 
     # ==================== 历史读写 ====================
@@ -236,14 +231,10 @@ class ChatController:
         session_manager.append_history(self.session_id, agent_type, query, reply)
 
     def _get_last_route(self) -> tuple[Optional[str], Optional[str]]:
-        """
-        读取上一轮路由结果（intent + query），用于上下文感知路由。
-        存储在 session 的特殊 key "__route__" 中。
-        """
+        """读取上一轮路由结果（intent + query），用于上下文感知路由。"""
         history = session_manager.get_history(self.session_id, "__route__")
         if not history:
             return None, None
-        # 最后两条是 {"role": "user", "content": query} 和 {"role": "assistant", "content": intent}
         if len(history) >= 2:
             return history[-1]["content"], history[-2]["content"]
         return None, None
@@ -258,16 +249,6 @@ class ChatController:
         """
         处理纯文本对话，返回统一响应字典。
         包含完整的两级路由 + 权限校验流程。
-
-        Args:
-            user_input: 用户原始输入
-
-        Returns:
-            {"intent": "...", "data": {"message": "..."}, "status": "success"/"error"}
-
-        新增：
-        - admin 鉴权失败时在入口直接拦截，不进入路由流程
-        - 读取上一轮路由信息并传入 supervisor.route()，解决指代/省略句问题
         """
         # admin 鉴权失败时直接拦截
         if self.user_role == "admin" and self._auth_failed:
@@ -283,10 +264,8 @@ class ChatController:
             }
 
         try:
-            # 读取上下文
             prev_intent, prev_query = self._get_last_route()
 
-            # 两级路由（传入历史上下文）
             processed_query, intent = self.supervisor.route(
                 user_input,
                 self.user_role,
@@ -294,10 +273,8 @@ class ChatController:
                 prev_query  = prev_query,
             )
 
-            # 保存本轮路由结果
             self._save_last_route(user_input, intent)
 
-            # 权限校验（v3：通过 _check_permission() 统一处理，admin 直接放行）
             if not self._check_permission(intent):
                 msg = (
                     _PERMISSION_DENIED_MESSAGES.get((self.user_role, intent))
@@ -330,12 +307,6 @@ class ChatController:
         处理文件上传（简历解析），直接调用 resume_agent，跳过路由。
         两种角色均可使用。
         resume_agent 每次独立分析，不读写历史。
-
-        Args:
-            file_path: 上传文件的本地路径（.pdf 或 .docx）
-
-        Returns:
-            统一响应字典（resume_agent 内部按 user_role 分支处理，均不写库）
         """
         try:
             response = resume_agent.handle(
@@ -375,7 +346,6 @@ class ChatController:
         """
         根据 user_id 查询招聘者关联的 company_id。
         结果缓存在实例变量中，同一请求只查一次数据库。
-        查不到时返回 None，调用方负责返回错误提示。
         """
         if hasattr(self, "_cached_company_id"):
             return self._cached_company_id
@@ -433,14 +403,9 @@ class ChatController:
         v4 新增：统一职位查询入口，按角色分发：
             jobseeker → job_search_agent（无 company_id / tenant_id 限制，搜索全平台公开职位）
             recruiter → job_manage_agent（注入 company_id，只能查本公司职位）
-            admin     → job_manage_agent（注入 tenant_id，可查租户下所有公司职位，
-                        覆盖原 platform_stats 中迁出的职位统计场景）
-
-        三段逻辑分别完整搬迁自原 _call_job_search()、_call_job_manage()、
-        _call_job_manage_admin()，无任何逻辑变更。
+            admin     → job_manage_agent（注入 tenant_id，可查租户下所有公司职位）
         """
         if self.user_role == "jobseeker":
-            # ── 原 _call_job_search() jobseeker 分支逻辑 ──────────
             history  = self._get_history("job_search")
             response = job_search_agent.handle(
                 query      = query,
@@ -452,7 +417,6 @@ class ChatController:
             return response
 
         elif self.user_role == "recruiter":
-            # ── 原 _call_job_manage() recruiter 分支逻辑 ──────────
             company_id = self._get_company_id()
             if company_id is None:
                 return {
@@ -472,7 +436,7 @@ class ChatController:
             return response
 
         else:
-            # ── 原 _call_job_manage_admin() 逻辑 ──────────────────
+            # admin 分支
             tenant_id = self._get_tenant_id()
             if tenant_id is None:
                 return {
@@ -496,13 +460,11 @@ class ChatController:
         """
         候选人查询分发（v4：对应新意图名 candidate_query，方法名保留不变）：
             recruiter → 注入 company_id（只能查本公司候选人）
-            admin     → 注入 tenant_id（可查租户下所有候选人，
-                        覆盖原 platform_stats 中迁出的报名统计场景）
+            admin     → 注入 tenant_id（可查租户下所有候选人）
         """
         if self.user_role == "admin":
             return self._call_candidate_search_admin(query)
 
-        # recruiter 原有逻辑
         company_id = self._get_company_id()
         if company_id is None:
             return {
@@ -545,9 +507,8 @@ class ChatController:
     def _call_platform_stats(self, query: str) -> dict:
         """
         平台统计（admin 专属）。
-        调用 platform_stats_agent，传入 tenant_id。
-        v4：platform_stats_agent 职责已缩减为纯企业统计 + 复杂分析，
-            职位/候选人统计由 job_query / candidate_query 的 admin 分支承接。
+        v5 变更：透传 session_id 和 page_size 给 platform_stats_agent，
+        支持 LLM 路径列表查询的分页缓存写入。
         """
         tenant_id = self._get_tenant_id()
         if tenant_id is None:
@@ -557,9 +518,10 @@ class ChatController:
                 "status": "error",
             }
         response = platform_stats_agent.handle(
-            query     = query,
-            tenant_id = tenant_id,
-            llm       = self.supervisor.llm,
+            query      = query,
+            tenant_id  = tenant_id,
+            session_id = self.session_id,
+            llm        = self.supervisor.llm,
         )
         return response
 

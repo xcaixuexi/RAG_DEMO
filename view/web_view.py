@@ -4,13 +4,18 @@ view/web_view.py — FastAPI Web 层
 接口：
     POST /api/chat              文字对话（首次查询，返回第 1 页）
     POST /api/file/upload       简历文件上传解析
-    GET  /api/jobs/page         职位/候选人翻页（从 session 缓存切片，不重查 DB）
+    GET  /api/jobs/page         职位/候选人/统计列表翻页（从 session 缓存切片，不重查 DB）
     GET  /api/stats             路由命中率统计
 
 v2 变更：
     - ChatRequest 新增可选字段 tenant_id（admin 登录时由前端传入，后端鉴权时自动覆盖）
     - /api/chat 透传 user_role 给 ChatController，admin 鉴权逻辑在 Controller 层执行
     - 收到 auth_failed 响应时，HTTP 状态码仍为 200，由前端根据 intent 字段判断并跳转
+
+v3 变更（统一响应规范）：
+    - /api/jobs/page 翻页接口支持 result_type="stats_rows"（platform_stats 列表翻页）
+    - 翻页响应统一使用 items 字段，去掉 data_key 硬编码
+    - intent 根据 result_type 自动推断
 """
 
 import os
@@ -66,11 +71,23 @@ app.add_middleware(
 class ChatRequest(BaseModel):
     user_id:    int = 161102110337
     user_role:  str                  # recruiter | jobseeker | admin
-    session_id: str = "3a7b9f2c-8d4e-4a1b-9c6d-7e8f2a1b3c4d"  # 前端生成的 UUID，用于关联历史会话
+    session_id: str = "3a7b9f2c-8d4e-4a1b-9c6d-7e8f2a1b3c4d"
     message:    str
-    page_size:  int = 20             # 首次查询时的每页条数
-    # admin 登录时前端可传入，实际 tenant_id 以后端鉴权结果为准，此字段仅供前端参考
+    page_size:  int = 20
     tenant_id:  Optional[int] = None
+
+
+# ─────────────────────────────────────────────
+# result_type → intent 映射
+# ─────────────────────────────────────────────
+
+_RESULT_TYPE_TO_INTENT = {
+    "jobs":       "job_search",
+    "candidates": "candidate_query",
+    "stats_rows": "platform_stats",
+}
+
+_VALID_RESULT_TYPES = set(_RESULT_TYPE_TO_INTENT.keys())
 
 
 # ─────────────────────────────────────────────
@@ -82,7 +99,7 @@ async def chat(request: ChatRequest) -> dict:
     """
     文字对话接口。
     职位/候选人类查询：返回第 1 页数据 + pagination 元信息。
-    其余意图：返回文本 message，无 pagination 字段。\n
+    其余意图：返回文本 message，items / pagination 均为 null。\n
     recruiter 招聘者\n
     jobseeker 求职者\n
     admin     user_id=88926257 平台管理员（需在后端完成 tenant_id 鉴权）\n
@@ -98,10 +115,10 @@ async def chat(request: ChatRequest) -> dict:
 
 @app.get("/api/jobs/page")
 async def jobs_page(
-    session_id:  str = Query(...,  description="会话 ID"),
-    result_type: str = Query("jobs", description="缓存类型：jobs | candidates"),
-    page:        int = Query(1,    ge=1,  description="页码，从 1 开始"),
-    page_size:   int = Query(20,   ge=1, le=100, description="每页条数，最大 100"),
+    session_id:  str = Query(...,          description="会话 ID"),
+    result_type: str = Query("jobs",       description="缓存类型：jobs | candidates | stats_rows"),
+    page:        int = Query(1,    ge=1,   description="页码，从 1 开始"),
+    page_size:   int = Query(20,   ge=1,  le=100, description="每页条数，最大 100"),
 ) -> dict:
     """
     翻页接口：从 session 内存缓存切片返回，不重新查询数据库。
@@ -114,12 +131,16 @@ async def jobs_page(
     result_type 说明：
         "jobs"       对应 job_search / job_manage 的职位列表
         "candidates" 对应 candidate_search 的候选人列表
+        "stats_rows" 对应 platform_stats LLM 路径的列表查询结果
 
     注意：count-only 查询（pagination 为 null）不写缓存，
     前端无需调用此接口，直接展示 message 中的总数即可。
     """
-    if result_type not in ("jobs", "candidates"):
-        raise HTTPException(status_code=400, detail="result_type 只能是 jobs 或 candidates")
+    if result_type not in _VALID_RESULT_TYPES:
+        raise HTTPException(
+            status_code = 400,
+            detail      = f"result_type 只能是 {' / '.join(_VALID_RESULT_TYPES)}",
+        )
 
     page_data = session_manager.get_page(
         session_id  = session_id,
@@ -134,12 +155,15 @@ async def jobs_page(
             detail      = "查询缓存已过期，请重新发起查询",
         )
 
-    data_key = "candidates" if result_type == "candidates" else "jobs"
+    intent = _RESULT_TYPE_TO_INTENT[result_type]
+
     return {
-        "intent": "candidate_search" if result_type == "candidates" else "job_search",
+        "intent": intent,
         "data": {
-            "message":   f"第 {page_data['page']} 页 / 共 {page_data['total_pages']} 页",
-            data_key:    page_data["items"],
+            "message":    f"第 {page_data['page']} 页 / 共 {page_data['total_pages']} 页",
+            "total":      page_data["total_db"],
+            "list_type":  result_type,
+            "items":      page_data["items"],
             "pagination": {
                 "page":        page_data["page"],
                 "page_size":   page_data["page_size"],
