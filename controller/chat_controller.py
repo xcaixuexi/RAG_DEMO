@@ -73,6 +73,7 @@ from rag_modules.agents import (
     platform_stats_agent,
 )
 from controller import session_manager
+from utils.timeout import call_with_timeout, make_timeout_response, LAYER_TOTAL
 
 logger = logging.getLogger(__name__)
 
@@ -290,8 +291,20 @@ class ChatController:
                     "status": "error",
                 }
 
-            handler  = self._agent_map.get(intent, self._call_unknown)
-            response = handler(processed_query)
+            handler = self._agent_map.get(intent, self._call_unknown)
+
+            # 整体兜底超时（防止 Agent 层超时未生效时的极端情况）
+            _total_fallback = make_timeout_response(
+                intent  = intent,
+                message = "抱歉，您的问题处理时间过长，请稍后重试或换个方式描述。",
+            )
+            response = call_with_timeout(
+                fn      = handler,
+                args    = (processed_query,),
+                timeout = LAYER_TOTAL,
+                fallback= _total_fallback,
+                label   = f"process_message[{intent}]",
+            )
 
         except Exception as e:
             logger.error(f"处理消息时出错: {e}")

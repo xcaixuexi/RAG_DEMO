@@ -26,6 +26,7 @@ from rag_modules.agents import (
     platform_stats_agent,
 )
 from utils.timer import timed
+from utils.timeout import with_timeout, make_timeout_response, LAYER_AGENT
 
 # 统一给所有 Agent 的 handle 函数注册计时
 # v3 说明：job_search_agent / job_manage_agent 现共同服务于 job_query 意图，
@@ -42,8 +43,30 @@ _agents = [
     ("platform_stats_agent",   platform_stats_agent),
 ]
 
+# 各 Agent 超时兜底响应（intent 字段与 Agent 正常响应保持一致）
+_AGENT_TIMEOUT_INTENTS: dict[str, str] = {
+    "resume_agent":           "resume_parse",
+    "job_search_agent":       "job_search",
+    "job_manage_agent":       "job_manage",
+    "candidate_search_agent": "candidate_query",
+    "knowledge_agent":        "knowledge",
+    "chitchat_agent":         "chitchat",
+    "unknown_agent":          "unknown",
+    "platform_stats_agent":   "platform_stats",
+}
+
 for _name, _module in _agents:
-    _module.handle = timed(_name)(_module.handle)
+    _intent   = _AGENT_TIMEOUT_INTENTS.get(_name, "unknown")
+    _fallback = make_timeout_response(
+        intent  = _intent,
+        message = "抱歉，当前问题处理超时，请稍后重试或换个方式描述。",
+    )
+    # 先挂超时，再挂计时（计时记录实际等待时间，含超时判断耗时）
+    _module.handle = timed(_name)(
+        with_timeout(seconds=LAYER_AGENT, fallback=_fallback, label=_name)(
+            _module.handle
+        )
+    )
 
 __all__ = [
     "resume_agent",

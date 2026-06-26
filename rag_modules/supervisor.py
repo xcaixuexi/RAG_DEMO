@@ -36,6 +36,7 @@ from langchain_core.runnables import RunnablePassthrough
 
 from utils.llm_factory import LLMFactory
 from utils.timer import timed
+from utils.timeout import call_with_timeout, LAYER_LLM_ROUTER
 
 logger = logging.getLogger(__name__)
 
@@ -359,12 +360,22 @@ class Supervisor:
         prompt = ChatPromptTemplate.from_template(_ROUTER_PROMPT_TEMPLATE)
         chain  = prompt | self.llm | StrOutputParser()
 
-        raw = chain.invoke({
+        invoke_kwargs = {
             "query":       query,
             "user_role":   user_role,
             "prev_intent": prev_intent or "无",
             "prev_query":  prev_query  or "无",
-        }).strip().lower()
+        }
+        raw = call_with_timeout(
+            fn      = chain.invoke,
+            args    = (invoke_kwargs,),
+            timeout = LAYER_LLM_ROUTER,
+            label   = "LLM路由",
+            # 超时时降级为 unknown，由 unknown_agent 兜底回复用户
+            fallback = "unknown|low",
+        )
+        if isinstance(raw, str):
+            raw = raw.strip().lower()
 
         # 解析 "intent|confidence" 格式
         intent, confidence = self._parse_router_output(raw, query)
